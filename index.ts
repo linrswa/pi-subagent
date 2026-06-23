@@ -1,0 +1,1051 @@
+/**
+ * Subagent Tool - delegate tasks to specialized pi agents with isolated context.
+ *
+ * Each invocation spawns one or more separate `pi --mode json -p --no-session`
+ * processes. This keeps child context windows isolated while streaming progress
+ * back into the parent tool result.
+ */
+
+import * as os from "node:os";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import {
+	Container,
+	Markdown,
+	matchesKey,
+	Spacer,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	type Component,
+	type OverlayHandle,
+	type OverlayOptions,
+	type TUI,
+} from "@earendil-works/pi-tui";
+import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
+import {
+	COLLAPSED_ITEM_COUNT,
+	MAX_CONCURRENCY,
+	MAX_PARALLEL_TASKS,
+} from "./constants.ts";
+import { getFinalOutput, getResultOutput, isFailedResult, truncateForParent } from "./results.ts";
+import {
+	SubagentManager,
+	buildRunRefContext,
+	createRunRefAutocompleteProvider,
+	getBgAgentCompletions,
+	getMode,
+	getRunRefCompletions,
+	normalizeAgentRef,
+} from "./manager.ts";
+import { findRunByRef, formatShortRunId } from "./run-refs.ts";
+import { SubagentPanelController } from "./panel.ts";
+import { runSingleAgent, mapWithConcurrencyLimit } from "./runner.ts";
+import {
+	SubagentSchedulerController,
+	formatRelativeTime,
+	formatScheduleId,
+	formatScheduleList,
+} from "./scheduler.ts";
+import { subagentRunStore, makeEmptyUsage } from "./store.ts";
+import { openSubagentRunViewer } from "./viewer.ts";
+import { SubagentWidgetController } from "./widget.ts";
+import {
+	BgAgentParamsSchema,
+	SubagentControlParamsSchema,
+	SubagentParamsSchema,
+	SubagentScheduleParamsSchema,
+} from "./schemas.ts";
+import type {
+	AgentMessage,
+	BgAgentParamsInput,
+	DisplayItem,
+	OnUpdateCallback,
+	RunStatus,
+	SingleResult,
+	StartBackgroundAgentResult,
+	SubagentControlParamsInput,
+	SubagentDetails,
+	SubagentMode,
+	SubagentParamsInput,
+	SubagentRun,
+	SubagentScheduleParamsInput,
+	TextContent,
+	ToolCallContent,
+	UsageStats,
+} from "./types.ts";
+
+export type {
+	AgentMessage,
+	MessageContent,
+	RunStatus,
+	SubagentMode,
+	SubagentRun,
+	SubagentRunSubscriber,
+	TextContent,
+	ToolCallContent,
+	UsageStats,
+} from "./types.ts";
+export { SubagentRunStore, subagentRunStore } from "./store.ts";
+
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1000000).toFixed(1)}M`;
+}
+
+function formatUsageStats(usage: UsageStats | Omit<UsageStats, "contextTokens">, model?: string): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	if ("contextTokens" in usage && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+	if (model) parts.push(model);
+	return parts.join(" ");
+}
+
+function shortenPath(filePath: string): string {
+	const home = os.homedir();
+	return filePath.startsWith(home) ? `~${filePath.slice(home.length)}` : filePath;
+}
+
+function formatToolCall(toolName: string, args: Record<string, unknown>, theme: ExtensionContext["ui"]["theme"]): string {
+	switch (toolName) {
+		case "bash": {
+			const command = typeof args.command === "string" ? args.command : "...";
+			const preview = command.length > 72 ? `${command.slice(0, 72)}...` : command;
+			return theme.fg("muted", "$ ") + theme.fg("toolOutput", preview);
+		}
+		case "read": {
+			const rawPath = String(args.path ?? args.file_path ?? "...");
+			const offset = typeof args.offset === "number" ? args.offset : undefined;
+			const limit = typeof args.limit === "number" ? args.limit : undefined;
+			let text = theme.fg("accent", shortenPath(rawPath));
+			if (offset !== undefined || limit !== undefined) {
+				const startLine = offset ?? 1;
+				const endLine = limit !== undefined ? startLine + limit - 1 : "";
+				text += theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+			}
+			return theme.fg("muted", "read ") + text;
+		}
+		case "write": {
+			const rawPath = String(args.path ?? args.file_path ?? "...");
+			const content = typeof args.content === "string" ? args.content : "";
+			const lines = content ? content.split("\n").length : 0;
+			return theme.fg("muted", "write ") + theme.fg("accent", shortenPath(rawPath)) + (lines ? theme.fg("dim", ` (${lines} lines)`) : "");
+		}
+		case "edit":
+			return theme.fg("muted", "edit ") + theme.fg("accent", shortenPath(String(args.path ?? args.file_path ?? "...")));
+		case "ls":
+			return theme.fg("muted", "ls ") + theme.fg("accent", shortenPath(String(args.path ?? ".")));
+		case "find":
+			return (
+				theme.fg("muted", "find ") +
+				theme.fg("accent", String(args.pattern ?? "*")) +
+				theme.fg("dim", ` in ${shortenPath(String(args.path ?? "."))}`)
+			);
+		case "grep":
+			return (
+				theme.fg("muted", "grep ") +
+				theme.fg("accent", `/${String(args.pattern ?? "")}/`) +
+				theme.fg("dim", ` in ${shortenPath(String(args.path ?? "."))}`)
+			);
+		default: {
+			const argsText = JSON.stringify(args);
+			const preview = argsText.length > 60 ? `${argsText.slice(0, 60)}...` : argsText;
+			return theme.fg("accent", toolName) + theme.fg("dim", ` ${preview}`);
+		}
+	}
+}
+
+function getDisplayItems(messages: AgentMessage[]): DisplayItem[] {
+	const items: DisplayItem[] = [];
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		for (const part of message.content) {
+			if (part.type === "text" && typeof (part as TextContent).text === "string") {
+				const text = (part as TextContent).text.trim();
+				if (text) items.push({ type: "text", text });
+			} else if (part.type === "toolCall") {
+				const toolCall = part as ToolCallContent;
+				items.push({ type: "toolCall", name: toolCall.name, args: toolCall.arguments ?? {} });
+			}
+		}
+	}
+	return items;
+}
+
+function aggregateUsage(results: SingleResult[]): Omit<UsageStats, "contextTokens"> {
+	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+	for (const result of results) {
+		total.input += result.usage.input;
+		total.output += result.usage.output;
+		total.cacheRead += result.usage.cacheRead;
+		total.cacheWrite += result.usage.cacheWrite;
+		total.cost += result.usage.cost;
+		total.turns += result.usage.turns;
+	}
+	return total;
+}
+
+function renderDisplayItems(
+	items: DisplayItem[],
+	limit: number | undefined,
+	expanded: boolean,
+	theme: ExtensionContext["ui"]["theme"],
+): string {
+	const toShow = limit ? items.slice(-limit) : items;
+	const skipped = limit && items.length > limit ? items.length - limit : 0;
+	let text = skipped > 0 ? theme.fg("muted", `... ${skipped} earlier items\n`) : "";
+	for (const item of toShow) {
+		if (item.type === "toolCall") {
+			text += `${theme.fg("muted", "→ ")}${formatToolCall(item.name, item.args, theme)}\n`;
+		} else {
+			const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
+			text += `${theme.fg("toolOutput", preview)}\n`;
+		}
+	}
+	return text.trimEnd();
+}
+
+function resultIcon(result: SingleResult, theme: ExtensionContext["ui"]["theme"]): string {
+	if (result.exitCode === -1) return theme.fg("warning", "⏳");
+	return isFailedResult(result) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+}
+
+function compactPreview(text: string | undefined, maxLength: number): string {
+	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
+	if (!normalized) return "...";
+	return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+}
+
+function resultStatusLabel(result: SingleResult): "running" | "completed" | "failed" | "aborted" {
+	if (result.exitCode === -1) return "running";
+	if (result.stopReason === "aborted") return "aborted";
+	return isFailedResult(result) ? "failed" : "completed";
+}
+
+function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["ui"]["theme"]): Container {
+	const container = new Container();
+	const running = details.results.filter((entry) => entry.exitCode === -1).length;
+	const failed = details.results.filter((entry) => entry.exitCode !== -1 && isFailedResult(entry)).length;
+	const succeeded = details.results.filter((entry) => entry.exitCode !== -1 && !isFailedResult(entry)).length;
+	const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+	const scope = theme.fg("muted", ` [${details.agentScope}]`);
+	let line: string;
+
+	if (details.mode === "single") {
+		const entry = details.results[0];
+		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}: ${theme.fg("dim", compactPreview(entry.task, 72))}${scope}`;
+	} else if (details.mode === "parallel") {
+		const done = succeeded + failed;
+		const summary = running > 0 ? `${running} running, ${done} done` : `${succeeded}/${details.results.length} succeeded${failed ? `, ${failed} failed` : ""}`;
+		line = `${topIcon} ${theme.fg("accent", "subagents")}: ${theme.fg("dim", summary)}${scope}`;
+	} else {
+		const runningIndex = details.results.findIndex((entry) => entry.exitCode === -1);
+		const failedIndex = details.results.findIndex((entry) => entry.exitCode !== -1 && isFailedResult(entry));
+		const activeIndex = runningIndex !== -1 ? runningIndex : failedIndex !== -1 ? failedIndex : details.results.length - 1;
+		const entry = details.results[activeIndex];
+		const step = entry.step ?? activeIndex + 1;
+		line = `${topIcon} ${theme.fg("accent", `chain step ${step}/${details.results.length}`)}: ${theme.fg("dim", `${entry.agent} ${resultStatusLabel(entry)}`)}${scope}`;
+	}
+
+	container.addChild(new Text(line, 0, 0));
+	container.addChild(new Text(theme.fg("muted", `${SUBAGENT_PANEL_SHORTCUT_LABEL} to open subagent panel`), 0, 0));
+	return container;
+}
+
+type SubagentPanelTheme = ExtensionContext["ui"]["theme"];
+
+// ponytail: overlay render gets width only; maxHeight slices this into a tmux-like full-height column.
+const SUBAGENT_PANEL_FILL_ROWS = 500;
+
+const SUBAGENT_PANEL_OVERLAY_OPTIONS: OverlayOptions = {
+	anchor: "top-right",
+	width: "25%",
+	minWidth: 32,
+	maxHeight: "100%",
+	visible: (termWidth) => termWidth >= 100,
+	nonCapturing: true,
+};
+
+function resolveSubagentPanelWidth(termWidth: number): number {
+	const rawWidth = SUBAGENT_PANEL_OVERLAY_OPTIONS.width;
+	const percent = typeof rawWidth === "string" ? rawWidth.match(/^(\d+(?:\.\d+)?)%$/)?.[1] : undefined;
+	let width = typeof rawWidth === "number" ? rawWidth : Math.floor((termWidth * Number(percent ?? 25)) / 100);
+	width = Math.max(width, SUBAGENT_PANEL_OVERLAY_OPTIONS.minWidth ?? 1);
+	return Math.max(1, Math.min(width, termWidth - 1));
+}
+// ponytail: Ctrl+0 is flaky in some terminals; Ctrl+= is the non-IME fallback.
+const SUBAGENT_PANEL_SHORTCUTS = ["ctrl+0", "ctrl+="] as const;
+const SUBAGENT_PANEL_COMMAND = "subagent-panel";
+const SUBAGENT_PANEL_SHORTCUT_LABEL = `Ctrl+0/Ctrl+= or /${SUBAGENT_PANEL_COMMAND}`;
+
+function matchesSubagentPanelShortcut(data: string): boolean {
+	return SUBAGENT_PANEL_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
+}
+
+function formatPanelDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const seconds = totalSeconds % 60;
+	const minutes = Math.floor(totalSeconds / 60) % 60;
+	const hours = Math.floor(totalSeconds / 3600);
+	if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+	return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatRunTime(run: SubagentRun): string {
+	if (run.status === "queued" || run.status === "running") return formatPanelDuration(Date.now() - run.startedAt);
+	if (run.status === "completed") return "done";
+	return run.status;
+}
+
+function runStatusIcon(status: RunStatus, theme: SubagentPanelTheme): string {
+	switch (status) {
+		case "queued":
+			return theme.fg("dim", "○");
+		case "running":
+			return theme.fg("warning", "●");
+		case "completed":
+			return theme.fg("success", "✓");
+		case "failed":
+			return theme.fg("error", "✗");
+		case "aborted":
+			return theme.fg("muted", "⊘");
+	}
+}
+
+function capText(text: string, max = 12_000): string {
+	return text.length > max ? `${text.slice(0, max)}\n...[truncated ${text.length - max} chars]` : text;
+}
+
+function plainDisplayItems(messages: AgentMessage[], limit = 20): string {
+	return getDisplayItems(messages)
+		.slice(-limit)
+		.map((item) => {
+			if (item.type === "toolCall") return `Tool ${item.name}: ${capText(JSON.stringify(item.args), 600)}`;
+			return capText(item.text, 2_000);
+		})
+		.join("\n\n");
+}
+
+function formatRunList(runs: readonly SubagentRun[]): string {
+	if (runs.length === 0) return "No subagents.";
+	return runs
+		.map((run) => {
+			const output = run.finalOutput || getFinalOutput(run.messages) || run.errorMessage || "";
+			const tool = run.currentTool ? `\n  current: ${run.currentTool}` : "";
+			const preview = output ? `\n  output: ${compactPreview(output, 180)}` : "";
+			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${tool}${preview}`;
+		})
+		.join("\n\n");
+}
+
+function buildFollowUpTask(run: SubagentRun, question: string, context: string | undefined): string {
+	const output = run.finalOutput || getFinalOutput(run.messages) || run.errorMessage || "(no output yet)";
+	const transcript = plainDisplayItems(run.messages);
+	return [
+		"You are a follow-up subagent continuing from a previous subagent run.",
+		"Answer the new question using the previous run context and any new main-agent context.",
+		"",
+		`Previous run: ${formatShortRunId(run.id)} (${run.id})`,
+		`Original agent: ${run.agent}`,
+		`Status: ${run.status}`,
+		`Original task:\n${run.task}`,
+		"",
+		`Previous output:\n${capText(output)}`,
+		transcript ? `\nRecent transcript:\n${capText(transcript)}` : "",
+		context ? `\nMain-agent context:\n${capText(context)}` : "",
+		`\nNew question/instruction:\n${question}`,
+	].join("\n");
+}
+
+function splitPanelRow(left: string, right: string, width: number): string {
+	const rightWidth = visibleWidth(right);
+	if (rightWidth >= width) return truncateToWidth(right, width, "…", true);
+
+	const leftWidth = Math.max(0, width - rightWidth - 1);
+	const safeLeft = leftWidth > 0 ? truncateToWidth(left, leftWidth, "…") : "";
+	const gap = " ".repeat(Math.max(1, width - visibleWidth(safeLeft) - rightWidth));
+	return `${safeLeft}${gap}${right}`;
+}
+
+function panelTaskPreview(text: string | undefined): string {
+	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
+	return normalized || "...";
+}
+
+const subagentWidgetController = new SubagentWidgetController();
+const subagentPanelController = new SubagentPanelController();
+const subagentSchedulerController = new SubagentSchedulerController();
+
+export default function (pi: ExtensionAPI) {
+	let sessionCwd = process.cwd();
+	const subagentManager = new SubagentManager(pi);
+
+	pi.on("session_start", (_event, ctx) => {
+		sessionCwd = ctx.cwd;
+		subagentWidgetController.start(ctx);
+		subagentPanelController.start(ctx);
+		void subagentSchedulerController.start(subagentManager, ctx);
+		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
+	});
+
+	pi.on("input", (event) => {
+		if (event.source === "extension" || event.text.trimStart().startsWith("/")) return { action: "continue" };
+		const context = buildRunRefContext(event.text);
+		if (!context) return { action: "continue" };
+		return { action: "transform", text: `${event.text}\n\n${context}` };
+	});
+
+	pi.on("session_shutdown", () => {
+		subagentWidgetController.stop();
+		subagentPanelController.stop();
+		subagentSchedulerController.stop();
+	});
+
+	for (const shortcut of SUBAGENT_PANEL_SHORTCUTS) {
+		pi.registerShortcut(shortcut, {
+			description: "Toggle/focus subagent panel",
+			handler: (ctx) => {
+				subagentPanelController.toggleFocus(ctx);
+			},
+		});
+	}
+
+	pi.registerCommand(SUBAGENT_PANEL_COMMAND, {
+		description: "Toggle/focus the subagent side panel",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("Subagent panel is only available in TUI mode.", "warning");
+				return;
+			}
+			subagentPanelController.toggleFocus(ctx);
+		},
+	});
+
+	pi.registerCommand("subagent-view", {
+		description: "Open a live subagent run viewer: /subagent-view <runId>",
+		getArgumentCompletions: (prefix) => getRunRefCompletions(prefix.replace(/^[&＆]/, "")),
+		handler: async (args, ctx) => {
+			const run = subagentManager.findRun(args.trim());
+			if (!run) return ctx.ui.notify(`Unknown subagent run: ${args.trim() || "(missing)"}`, "warning");
+			openSubagentRunViewer(ctx, run.id);
+		},
+	});
+
+	pi.registerCommand("subagent-schedules", {
+		description: "List/delete subagent schedules: /subagent-schedules [delete] <id>",
+		getArgumentCompletions: (prefix) => {
+			const jobs = subagentSchedulerController.list();
+			const query = prefix.trim().replace(/^delete\s+/, "").replace(/^@/, "");
+			const items = jobs
+				.filter((job) => !query || job.id.includes(query) || formatScheduleId(job.id).slice(1).includes(query))
+				.map((job) => ({ value: formatScheduleId(job.id), label: formatScheduleId(job.id), description: `${job.schedule}: ${compactPreview(job.prompt, 80)}` }));
+			return items.length ? items : null;
+		},
+		handler: async (args, ctx) => {
+			const available = await subagentSchedulerController.ensure(subagentManager, ctx);
+			if (!available) return ctx.ui.notify("Subagent schedules require a persisted session.", "warning");
+			const trimmed = args.trim();
+			if (trimmed) {
+				const id = trimmed.replace(/^delete\s+/i, "");
+				const deleted = await subagentSchedulerController.delete(id);
+				return ctx.ui.notify(deleted ? `Deleted schedule ${id}.` : `Unknown schedule: ${id}`, deleted ? "info" : "warning");
+			}
+			ctx.ui.notify(formatScheduleList(subagentSchedulerController.list()), "info");
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_control",
+		label: "Subagent Control",
+		description: "Inspect and control existing subagent runs. Can ask a follow-up question by starting a new subagent with prior run context.",
+		promptSnippet: "Use subagent_control to list/status subagent runs, ask a selected run follow-up questions, stop runs, or delete runs.",
+		promptGuidelines: [
+			"Use action=list/status before referring to subagents if the run id is unclear.",
+			"runId accepts subagent-3, &3, or 3.",
+			"action=ask starts a new follow-up subagent with the selected run's output/transcript plus your question/context; it is not live stdin to the old process.",
+		],
+		parameters: SubagentControlParamsSchema as never,
+
+		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
+			const params = rawParams as SubagentControlParamsInput;
+			const action = params.action ?? "list";
+			const runs = subagentManager.listRuns();
+
+			if (action === "list" || action === "status") {
+				return { content: [{ type: "text", text: formatRunList(runs) }], details: { action } };
+			}
+
+			const run = subagentManager.findRun(params.runId, runs);
+			if (!run) {
+				return { content: [{ type: "text", text: `Unknown subagent run: ${params.runId ?? "(missing)"}\n\n${formatRunList(runs)}` }], details: { action } };
+			}
+
+			if (action === "stop") {
+				const stopped = subagentManager.stopRun(run.id);
+				return { content: [{ type: "text", text: stopped ? `Stopping ${formatShortRunId(run.id)}.` : `${formatShortRunId(run.id)} is not running.` }], details: { action, runId: run.id } };
+			}
+
+			if (action === "delete") {
+				subagentManager.deleteRun(run.id);
+				return { content: [{ type: "text", text: `Deleted ${formatShortRunId(run.id)}.` }], details: { action, runId: run.id } };
+			}
+
+			const question = params.question?.trim();
+			if (!question) return { content: [{ type: "text", text: "action=ask requires question." }], details: { action, runId: run.id } };
+
+			const agentScope: AgentScope = params.agentScope ?? (run.agentSource === "project" ? "both" : "user");
+			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const agents = discovery.agents;
+			const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			let fallbackThinkingLevel: string | undefined;
+			try {
+				fallbackThinkingLevel = pi.getThinkingLevel();
+			} catch {
+				fallbackThinkingLevel = undefined;
+			}
+
+			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
+				mode: "single",
+				agentScope,
+				packageAgentsDir: discovery.packageAgentsDir,
+				userAgentsDir: discovery.userAgentsDir,
+				projectAgentsDir: discovery.projectAgentsDir,
+				results,
+			});
+			const result = await runSingleAgent(
+				"single",
+				ctx.cwd,
+				agents,
+				params.agent ?? run.agent,
+				fallbackModel,
+				fallbackThinkingLevel,
+				buildFollowUpTask(run, question, params.context),
+				params.cwd ?? run.cwd,
+				undefined,
+				signal,
+				onUpdate as OnUpdateCallback | undefined,
+				makeDetails,
+			);
+
+			return {
+				content: [{ type: "text", text: isFailedResult(result) ? `Follow-up failed: ${getResultOutput(result)}` : getResultOutput(result) }],
+				details: makeDetails([result]),
+			};
+		},
+
+		renderCall(args: SubagentControlParamsInput, theme) {
+			const action = args.action ?? "list";
+			const target = args.runId ? ` ${args.runId}` : "";
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_control "))}${theme.fg("accent", action)}${theme.fg("dim", target)}`, 0, 0);
+		},
+
+		renderResult(result, _options, theme) {
+			const first = result.content?.[0];
+			const text = first?.type === "text" ? first.text : "(no output)";
+			return new Text(theme.fg("toolOutput", text), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "bg_agent",
+		label: "Background Agent",
+		description: "Start a subagent in the background and return immediately with a run id.",
+		promptSnippet: "Start a background subagent for work that should not block the main agent; returns a run id for subagent_control.",
+		promptGuidelines: [
+			"Use bg_agent when the user asks to run work in the background or when the main answer does not need the result before continuing.",
+			"Use subagent instead of bg_agent when the main agent must wait for the subagent result.",
+			"After bg_agent starts a run, use subagent_control list/status/ask/stop/delete to inspect or control it.",
+		],
+		parameters: BgAgentParamsSchema as never,
+
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			const result = await subagentManager.startBackground(ctx, rawParams as BgAgentParamsInput);
+			if (result.ok === false) return { content: [{ type: "text", text: result.message }], details: { ok: false } };
+			const id = formatShortRunId(result.run.id);
+			return {
+				content: [{ type: "text", text: `Started ${result.run.agent} ${id} in background. Use subagent_control with runId ${id} to inspect it.` }],
+				details: { ok: true, runId: result.run.id, agent: result.run.agent, agentScope: result.agentScope },
+			};
+		},
+
+		renderCall(args: BgAgentParamsInput, theme) {
+			const agentName = args.agent || "scout";
+			return new Text(
+				`${theme.fg("warning", "⏳")} ${theme.fg("toolTitle", theme.bold("bg_agent "))}${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.prompt, 72))}`,
+				0,
+				0,
+			);
+		},
+
+		renderResult(result, _options, theme) {
+			const first = result.content?.[0];
+			const text = first?.type === "text" ? first.text : "(no output)";
+			return new Text(theme.fg("toolOutput", text), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_schedule",
+		label: "Subagent Schedule",
+		description: "Session-scoped scheduled background subagents. Supports interval (30s/5m/1h/2d), relative one-shot (+10m), ISO timestamp, and 6-field cron.",
+		promptSnippet: "Use subagent_schedule to add/list/delete scheduled background subagent runs for the current session.",
+		promptGuidelines: [
+			"Use action=add with schedule and prompt to start future background subagents.",
+			"Scheduled runs use bg_agent/startBackgroundAgent with confirmProjectAgents=false.",
+			"Use action=list before delete if the schedule id is unclear.",
+		],
+		parameters: SubagentScheduleParamsSchema as never,
+
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			const params = rawParams as SubagentScheduleParamsInput;
+			const action = params.action ?? "list";
+			const available = await subagentSchedulerController.ensure(subagentManager, ctx);
+			if (!available) return { content: [{ type: "text", text: "Subagent schedules require a persisted session." }], details: { ok: false, action } };
+
+			if (action === "list") {
+				const jobs = subagentSchedulerController.list();
+				return { content: [{ type: "text", text: formatScheduleList(jobs) }], details: { ok: true, action, jobs } };
+			}
+
+			if (action === "delete") {
+				const deleted = await subagentSchedulerController.delete(params.id);
+				return { content: [{ type: "text", text: deleted ? `Deleted schedule ${params.id}.` : `Unknown schedule: ${params.id ?? "(missing)"}` }], details: { ok: deleted, action, id: params.id } };
+			}
+
+			const result = await subagentSchedulerController.add(params);
+			if (result.ok === false) return { content: [{ type: "text", text: result.message }], details: { ok: false, action } };
+			return {
+				content: [{ type: "text", text: `Scheduled ${formatScheduleId(result.job.id)} (${result.job.schedule}); next ${formatRelativeTime(result.job.nextRunAt)}.` }],
+				details: { ok: true, action, job: result.job },
+			};
+		},
+
+		renderCall(args: SubagentScheduleParamsInput, theme) {
+			const action = args.action ?? "list";
+			const target = action === "add" ? `${args.schedule ?? "?"}: ${compactPreview(args.prompt, 60)}` : (args.id ?? "");
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_schedule "))}${theme.fg("accent", action)} ${theme.fg("dim", target)}`, 0, 0);
+		},
+
+		renderResult(result, _options, theme) {
+			const first = result.content?.[0];
+			const text = first?.type === "text" ? first.text : "(no output)";
+			return new Text(theme.fg("toolOutput", text), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description: [
+			"Delegate tasks to specialized subagents with isolated context windows.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			'Default agent scope is "user" (bundled agents + ~/.pi/agent/agents).',
+			'To enable repo-local .pi/agents, set agentScope: "both" or "project".',
+		].join(" "),
+		promptSnippet: "Delegate focused work to specialized subagents with isolated context; supports single, parallel, and chained tasks.",
+		promptGuidelines: [
+			"Use subagent for focused codebase reconnaissance, implementation planning, or independent code review when isolation helps.",
+			"Use subagent parallel mode for read-only research/review tasks; avoid parallel subagents that edit the same files.",
+			"Use subagent chain mode with {previous} to pass scout findings to planner or reviewer output to worker.",
+		],
+		parameters: SubagentParamsSchema as never,
+
+		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
+			const params = rawParams as SubagentParamsInput;
+			const agentScope: AgentScope = params.agentScope ?? "user";
+			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const agents = discovery.agents;
+			const mode = getMode(params);
+			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+
+			const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			let fallbackThinkingLevel: string | undefined;
+			try {
+				fallbackThinkingLevel = pi.getThinkingLevel();
+			} catch {
+				fallbackThinkingLevel = undefined;
+			}
+
+			const makeDetails =
+				(selectedMode: SubagentMode) =>
+				(results: SingleResult[]): SubagentDetails => ({
+					mode: selectedMode,
+					agentScope,
+					packageAgentsDir: discovery.packageAgentsDir,
+					userAgentsDir: discovery.userAgentsDir,
+					projectAgentsDir: discovery.projectAgentsDir,
+					results,
+				});
+
+			if (!mode) {
+				const list = formatAgentList(agents);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Invalid parameters. Provide exactly one mode: {agent, task}, {tasks}, or {chain}.\n\nAvailable agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`,
+						},
+					],
+					details: makeDetails("single")([]),
+				};
+			}
+
+			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+				const requestedAgentNames = new Set<string>();
+				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+				if (params.tasks) for (const task of params.tasks) requestedAgentNames.add(task.agent);
+				if (params.agent) requestedAgentNames.add(params.agent);
+
+				const projectAgentsRequested = Array.from(requestedAgentNames)
+					.map((name) => agents.find((agent) => agent.name === name))
+					.filter((agent): agent is AgentConfig => agent?.source === "project");
+
+				if (projectAgentsRequested.length > 0) {
+					const names = projectAgentsRequested.map((agent) => agent.name).join(", ");
+					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					const ok = await ctx.ui.confirm(
+						"Run project-local agents?",
+						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled prompts. Only continue for trusted repositories.`,
+					);
+					if (!ok) {
+						return {
+							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+							details: makeDetails(mode)([]),
+						};
+					}
+				}
+			}
+
+			if (mode === "chain" && params.chain) {
+				const results: SingleResult[] = [];
+				let previousOutput = "";
+
+				for (let i = 0; i < params.chain.length; i++) {
+					const step = params.chain[i];
+					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const chainUpdate: OnUpdateCallback | undefined = onUpdate
+						? (partial) => {
+								const currentResult = partial.details?.results[0];
+								if (!currentResult) return;
+								onUpdate({ content: partial.content, details: makeDetails("chain")([...results, currentResult]) });
+							}
+						: undefined;
+
+					const result = await runSingleAgent(
+						"chain",
+						ctx.cwd,
+						agents,
+						step.agent,
+						fallbackModel,
+						fallbackThinkingLevel,
+						taskWithContext,
+						step.cwd,
+						i + 1,
+						signal,
+						chainUpdate,
+						makeDetails("chain"),
+					);
+					results.push(result);
+
+					if (isFailedResult(result)) {
+						return {
+							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${getResultOutput(result)}` }],
+							details: makeDetails("chain")(results),
+						};
+					}
+
+					previousOutput = getFinalOutput(result.messages);
+				}
+
+				return {
+					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					details: makeDetails("chain")(results),
+				};
+			}
+
+			if (mode === "parallel" && params.tasks) {
+				if (params.tasks.length > MAX_PARALLEL_TASKS) {
+					return {
+						content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+						details: makeDetails("parallel")([]),
+					};
+				}
+
+				const allResults: SingleResult[] = params.tasks.map((task) => ({
+					agent: task.agent,
+					agentSource: "unknown",
+					task: task.task,
+					exitCode: -1,
+					messages: [],
+					stderr: "",
+					usage: makeEmptyUsage(),
+				}));
+
+				const emitParallelUpdate = () => {
+					const running = allResults.filter((result) => result.exitCode === -1).length;
+					const done = allResults.length - running;
+					onUpdate?.({
+						content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
+						details: makeDetails("parallel")([...allResults]),
+					});
+				};
+
+				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (task, index) => {
+					const result = await runSingleAgent(
+						"parallel",
+						ctx.cwd,
+						agents,
+						task.agent,
+						fallbackModel,
+						fallbackThinkingLevel,
+						task.task,
+						task.cwd,
+						undefined,
+						signal,
+						(partial) => {
+							if (partial.details?.results[0]) {
+								allResults[index] = partial.details.results[0];
+								emitParallelUpdate();
+							}
+						},
+						makeDetails("parallel"),
+					);
+					allResults[index] = result;
+					emitParallelUpdate();
+					return result;
+				});
+
+				const successCount = results.filter((result) => !isFailedResult(result)).length;
+				const summaries = results.map((result) => {
+					const status = isFailedResult(result)
+						? `failed${result.stopReason && result.stopReason !== "end" ? ` (${result.stopReason})` : ""}`
+						: "completed";
+					return `### [${result.agent}] ${status}\n\n${truncateForParent(getResultOutput(result))}`;
+				});
+
+				return {
+					content: [{ type: "text", text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}` }],
+					details: makeDetails("parallel")(results),
+				};
+			}
+
+			if (mode === "single" && params.agent && params.task) {
+				const result = await runSingleAgent(
+					"single",
+					ctx.cwd,
+					agents,
+					params.agent,
+					fallbackModel,
+					fallbackThinkingLevel,
+					params.task,
+					params.cwd,
+					undefined,
+					signal,
+					onUpdate as OnUpdateCallback | undefined,
+					makeDetails("single"),
+				);
+
+				return {
+					content: [{ type: "text", text: isFailedResult(result) ? `Agent failed: ${getResultOutput(result)}` : getResultOutput(result) }],
+					details: makeDetails("single")([result]),
+				};
+			}
+
+			const list = formatAgentList(agents);
+			return {
+				content: [{ type: "text", text: `Invalid parameters. Available agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}` }],
+				details: makeDetails("single")([]),
+			};
+		},
+
+		renderCall(args: SubagentParamsInput, theme, context: { expanded?: boolean }) {
+			const scope: AgentScope = args.agentScope ?? "user";
+			const scopeSuffix = theme.fg("muted", ` [${scope}]`);
+
+			if (!context?.expanded) {
+				if (args.chain && args.chain.length > 0) {
+					const firstStep = args.chain[0];
+					return new Text(
+						`${theme.fg("warning", "⏳")} ${theme.fg("accent", `chain (${args.chain.length} steps)`)}: ${theme.fg("dim", firstStep.agent)}${scopeSuffix}`,
+						0,
+						0,
+					);
+				}
+
+				if (args.tasks && args.tasks.length > 0) {
+					return new Text(
+						`${theme.fg("warning", "⏳")} ${theme.fg("accent", "subagents")}: ${theme.fg("dim", `${args.tasks.length} tasks`)}${scopeSuffix}`,
+						0,
+						0,
+					);
+				}
+
+				const agentName = args.agent || "...";
+				return new Text(
+					`${theme.fg("warning", "⏳")} ${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.task, 72))}${scopeSuffix}`,
+					0,
+					0,
+				);
+			}
+
+			if (args.chain && args.chain.length > 0) {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `chain (${args.chain.length} steps)`) +
+					theme.fg("muted", ` [${scope}]`);
+				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
+					const step = args.chain[i];
+					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+					const preview = cleanTask.length > 48 ? `${cleanTask.slice(0, 48)}...` : cleanTask;
+					text += `\n  ${theme.fg("muted", `${i + 1}.`)} ${theme.fg("accent", step.agent)}${theme.fg("dim", ` ${preview}`)}`;
+				}
+				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
+				return new Text(text, 0, 0);
+			}
+
+			if (args.tasks && args.tasks.length > 0) {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
+					theme.fg("muted", ` [${scope}]`);
+				for (const task of args.tasks.slice(0, 3)) {
+					const preview = task.task.length > 48 ? `${task.task.slice(0, 48)}...` : task.task;
+					text += `\n  ${theme.fg("accent", task.agent)}${theme.fg("dim", ` ${preview}`)}`;
+				}
+				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
+				return new Text(text, 0, 0);
+			}
+
+			const agentName = args.agent || "...";
+			const preview = args.task ? (args.task.length > 72 ? `${args.task.slice(0, 72)}...` : args.task) : "...";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", agentName) +
+					theme.fg("muted", ` [${scope}]`) +
+					`\n  ${theme.fg("dim", preview)}`,
+				0,
+				0,
+			);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as SubagentDetails | undefined;
+			if (!details || details.results.length === 0) {
+				const first = result.content?.[0];
+				const text = first?.type === "text" ? first.text : "(no output)";
+				if (expanded) return new Text(text, 0, 0);
+				const container = new Container();
+				container.addChild(new Text(text, 0, 0));
+				container.addChild(new Text(theme.fg("muted", `${SUBAGENT_PANEL_SHORTCUT_LABEL} to open subagent panel`), 0, 0));
+				return container;
+			}
+
+			if (!expanded) return renderCompactResult(details, theme);
+
+			const mdTheme = getMarkdownTheme();
+			const container = new Container();
+			const modeLabel = details.mode === "single" ? details.results[0]?.agent : details.mode;
+			const running = details.results.filter((entry) => entry.exitCode === -1).length;
+			const failed = details.results.filter((entry) => entry.exitCode !== -1 && isFailedResult(entry)).length;
+			const succeeded = details.results.filter((entry) => entry.exitCode !== -1 && !isFailedResult(entry)).length;
+			const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+			const topStatus =
+				details.mode === "single"
+					? `${modeLabel ?? "subagent"}`
+					: running > 0
+						? `${succeeded + failed}/${details.results.length} done, ${running} running`
+						: `${succeeded}/${details.results.length} succeeded`;
+
+			container.addChild(
+				new Text(
+					`${topIcon} ${theme.fg("toolTitle", theme.bold(details.mode === "single" ? "subagent " : `${details.mode} `))}${theme.fg("accent", topStatus)}${theme.fg("muted", ` [${details.agentScope}]`)}`,
+					0,
+					0,
+				),
+			);
+
+			for (const entry of details.results) {
+				const icon = resultIcon(entry, theme);
+				const source = entry.agentSource !== "unknown" ? theme.fg("muted", ` (${entry.agentSource})`) : "";
+				const label = entry.step ? `Step ${entry.step}: ${entry.agent}` : entry.agent;
+				const displayItems = getDisplayItems(entry.messages);
+				const finalOutput = getFinalOutput(entry.messages);
+
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)}${source} ${icon}`, 0, 0));
+				if (expanded) {
+					container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", entry.task), 0, 0));
+				}
+
+				if (displayItems.length === 0) {
+					container.addChild(new Text(theme.fg("muted", entry.exitCode === -1 ? "(running...)" : "(no output)"), 0, 0));
+				} else if (expanded) {
+					for (const item of displayItems) {
+						if (item.type === "toolCall") {
+							container.addChild(new Text(`${theme.fg("muted", "→ ")}${formatToolCall(item.name, item.args, theme)}`, 0, 0));
+						}
+					}
+					if (finalOutput) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+					}
+				} else {
+					container.addChild(new Text(renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT, false, theme), 0, 0));
+				}
+
+				if (entry.errorMessage) container.addChild(new Text(theme.fg("error", `Error: ${entry.errorMessage}`), 0, 0));
+				const usage = formatUsageStats(entry.usage, entry.model);
+				if (usage) container.addChild(new Text(theme.fg("dim", usage), 0, 0));
+			}
+
+			if (details.results.length > 1) {
+				const usage = formatUsageStats(aggregateUsage(details.results));
+				if (usage) {
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", `Total: ${usage}`), 0, 0));
+				}
+			}
+
+			if (!expanded) container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
+			return container;
+		},
+	});
+
+	pi.registerCommand("bg", {
+		description: "Start a background subagent: /bg [agent] <prompt>",
+		getArgumentCompletions: (prefix) => getBgAgentCompletions(sessionCwd, prefix),
+		handler: async (args, ctx) => {
+			let text = args.trim();
+			if (!text && ctx.hasUI) text = (await ctx.ui.input("Background agent", "Prompt"))?.trim() ?? "";
+			if (!text) return ctx.ui.notify("Usage: /bg [agent] <prompt>", "warning");
+
+			const discovery = discoverAgents(ctx.cwd, "user");
+			const [firstWord, ...restWords] = text.split(/\s+/);
+			const firstAgent = normalizeAgentRef(firstWord);
+			const agent = firstAgent && restWords.length > 0 && discovery.agents.some((candidate) => candidate.name === firstAgent) ? firstAgent : undefined;
+			const prompt = agent ? restWords.join(" ") : text;
+			const result = await subagentManager.startBackground(ctx, { prompt, agent });
+			if (result.ok === false) return ctx.ui.notify(result.message, "warning");
+
+			ctx.ui.notify(`Started ${result.run.agent} ${formatShortRunId(result.run.id)} in background.`, "info");
+		},
+	});
+
+	pi.registerCommand("subagents", {
+		description: "List available subagents for this project",
+		handler: async (args, ctx) => {
+			const scopeArg = args.trim() as AgentScope | "";
+			const scope: AgentScope = scopeArg === "project" || scopeArg === "both" || scopeArg === "user" ? scopeArg : "user";
+			const discovery = discoverAgents(ctx.cwd, scope);
+			const list = formatAgentList(discovery.agents, 100);
+			ctx.ui.notify(`Subagents [${scope}]:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`, "info");
+		},
+	});
+}

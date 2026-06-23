@@ -1,0 +1,30 @@
+{
+  "name": "pi-subagent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 index.ts agents.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "croner": "^10.0.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
