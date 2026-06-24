@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
-import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
 import { getResultOutput, isFailedResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
-import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentControlParamsInput, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
+import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
 
 function compactPreview(text: string | undefined, maxLength: number): string {
 	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
@@ -34,7 +34,7 @@ export function normalizeAgentRef(agent: string | undefined): string | undefined
 export function chooseBackgroundAgent(agents: AgentConfig[], requestedAgent: string | undefined): string | undefined {
 	const requested = normalizeAgentRef(requestedAgent);
 	if (requested) return requested;
-	return agents.find((agent) => agent.name === "scout")?.name ?? agents[0]?.name;
+	return agents.find((agent) => agent.name === "explorer")?.name ?? agents[0]?.name;
 }
 
 export function getAgentCompletions(cwd: string, token: string, scope: AgentScope = "user"): AutocompleteItem[] {
@@ -119,7 +119,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 	if (!task) return { ok: false, message: "bg_agent requires prompt." };
 
 	const agentScope: AgentScope = params.agentScope ?? "user";
-	const discovery = discoverAgents(ctx.cwd, agentScope);
+	const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
 	const agentName = chooseBackgroundAgent(discovery.agents, params.agent);
 	if (!agentName) return { ok: false, message: "No subagents available." };
 

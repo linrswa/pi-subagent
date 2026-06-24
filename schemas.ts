@@ -76,7 +76,7 @@ export const BgAgentParamsSchema = {
 	required: ["prompt"],
 	properties: {
 		prompt: { type: "string", description: "Prompt/task for the background agent." },
-		agent: { type: "string", description: "Agent name. Defaults to scout when available, otherwise the first available agent." },
+		agent: { type: "string", description: "Agent name. Defaults to explorer when available, otherwise the first available agent." },
 		agentScope: {
 			type: "string",
 			enum: ["user", "project", "both"],
@@ -104,7 +104,7 @@ export const SubagentScheduleParamsSchema = {
 		id: { type: "string", description: "Schedule id for delete." },
 		schedule: { type: "string", description: "30s/5m/1h/2d interval, +10m one-shot, ISO timestamp, or 6-field cron." },
 		prompt: { type: "string", description: "Prompt/task to run when the schedule fires." },
-		agent: { type: "string", description: "Agent name. Defaults to scout when available." },
+		agent: { type: "string", description: "Agent name. Defaults to explorer when available." },
 		agentScope: { type: "string", enum: ["user", "project", "both"], default: "user" },
 		cwd: { type: "string", description: "Working directory for scheduled background runs." },
 	},

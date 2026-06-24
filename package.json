@@ -7,7 +7,8 @@
     "pi-package"
   ],
   "scripts": {
-    "check": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 index.ts agents.ts"
+    "check": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 index.ts agents.ts",
+    "test": "node --experimental-strip-types --test tests/agents-settings.test.ts"
   },
   "pi": {
     "extensions": [

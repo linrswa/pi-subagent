@@ -116,7 +116,7 @@ export function formatScheduleList(jobs: readonly SubagentScheduleJob[]): string
 		.map((job) => {
 			const next = job.nextRunAt && job.nextRunAt <= MAX_DATE_MS ? `${new Date(job.nextRunAt).toISOString()} (${formatRelativeTime(job.nextRunAt)})` : "unscheduled";
 			const last = job.lastRunAt ? `\n  last: ${new Date(job.lastRunAt).toISOString()}${job.lastRunId ? ` ${formatShortRunId(job.lastRunId)}` : ""}` : "";
-			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "scout"} [${job.agentScope}]\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
+			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "explorer"} [${job.agentScope}]\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
 		})
 		.join("\n\n");
 }

@@ -10,10 +10,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter, SettingsManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "package" | "user" | "project";
+export type AgentSettingsScope = "global" | "project";
 
 export interface AgentConfig {
 	name: string;
@@ -31,6 +32,8 @@ export interface AgentDiscoveryResult {
 	userAgentsDir: string;
 	projectAgentsDir: string | null;
 }
+
+export type AgentModelDefaults = Record<string, string>;
 
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
 const packageAgentsDir = path.join(extensionDir, "agents");
@@ -54,6 +57,72 @@ function parseTools(value: unknown): string[] | undefined {
 	}
 
 	return undefined;
+}
+
+function agentModelDefaultsFrom(settings: unknown): AgentModelDefaults {
+	const subagent = (settings as { subagent?: unknown }).subagent;
+	if (!subagent || typeof subagent !== "object" || Array.isArray(subagent)) return {};
+
+	const agentModels = (subagent as { agentModels?: unknown }).agentModels;
+	if (!agentModels || typeof agentModels !== "object" || Array.isArray(agentModels)) return {};
+
+	const defaults: AgentModelDefaults = {};
+	for (const [agentName, model] of Object.entries(agentModels)) {
+		const modelName = stringField(model);
+		if (agentName && modelName) defaults[agentName] = modelName;
+	}
+	return defaults;
+}
+
+export function getAgentModelDefaults(cwd: string, projectTrusted = true): AgentModelDefaults {
+	const settings = SettingsManager.create(cwd, undefined, { projectTrusted });
+	return {
+		...agentModelDefaultsFrom(settings.getGlobalSettings()),
+		...agentModelDefaultsFrom(settings.getProjectSettings()),
+	};
+}
+
+function applyAgentModelDefaults(agents: AgentConfig[], defaults: AgentModelDefaults): AgentConfig[] {
+	return agents.map((agent) => {
+		const model = defaults[agent.name];
+		return model ? { ...agent, model } : agent;
+	});
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function getAgentSettingsPath(cwd: string, scope: AgentSettingsScope): string {
+	return scope === "global"
+		? path.join(getAgentDir(), "settings.json")
+		: path.join(path.resolve(cwd), CONFIG_DIR_NAME, "settings.json");
+}
+
+async function readSettingsJson(filePath: string): Promise<Record<string, unknown>> {
+	try {
+		const data = JSON.parse(await fs.promises.readFile(filePath, "utf-8"));
+		return isRecord(data) ? data : {};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw error;
+	}
+}
+
+export async function setAgentModelDefault(cwd: string, scope: AgentSettingsScope, agentName: string, model: string): Promise<string> {
+	const filePath = getAgentSettingsPath(cwd, scope);
+	await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+	await withFileMutationQueue(filePath, async () => {
+		const settings = await readSettingsJson(filePath);
+		const subagent = isRecord(settings.subagent) ? settings.subagent : {};
+		const agentModels = isRecord(subagent.agentModels) ? subagent.agentModels : {};
+		const trimmed = model.trim();
+		if (trimmed) agentModels[agentName] = trimmed;
+		else delete agentModels[agentName];
+		settings.subagent = { ...subagent, agentModels };
+		await fs.promises.writeFile(filePath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+	});
+	return filePath;
 }
 
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
@@ -137,6 +206,11 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		userAgentsDir,
 		projectAgentsDir,
 	};
+}
+
+export function discoverAgentsWithSettings(cwd: string, scope: AgentScope, projectTrusted = true): AgentDiscoveryResult {
+	const discovery = discoverAgents(cwd, scope);
+	return { ...discovery, agents: applyAgentModelDefaults(discovery.agents, getAgentModelDefaults(cwd, projectTrusted)) };
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems = 20): { text: string; remaining: number } {

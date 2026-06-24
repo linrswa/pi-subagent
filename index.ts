@@ -12,17 +12,10 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	Markdown,
-	matchesKey,
 	Spacer,
 	Text,
-	truncateToWidth,
-	visibleWidth,
-	type Component,
-	type OverlayHandle,
-	type OverlayOptions,
-	type TUI,
 } from "@earendil-works/pi-tui";
-import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList, getAgentModelDefaults, setAgentModelDefault } from "./agents.ts";
 import {
 	COLLAPSED_ITEM_COUNT,
 	MAX_CONCURRENCY,
@@ -38,8 +31,7 @@ import {
 	getRunRefCompletions,
 	normalizeAgentRef,
 } from "./manager.ts";
-import { findRunByRef, formatShortRunId } from "./run-refs.ts";
-import { SubagentPanelController } from "./panel.ts";
+import { formatShortRunId } from "./run-refs.ts";
 import { runSingleAgent, mapWithConcurrencyLimit } from "./runner.ts";
 import {
 	SubagentSchedulerController,
@@ -47,9 +39,9 @@ import {
 	formatScheduleId,
 	formatScheduleList,
 } from "./scheduler.ts";
-import { subagentRunStore, makeEmptyUsage } from "./store.ts";
+import { makeEmptyUsage } from "./store.ts";
+import { SubagentSettingsComponent } from "./settings-ui.ts";
 import { openSubagentRunViewer } from "./viewer.ts";
-import { SubagentWidgetController } from "./widget.ts";
 import {
 	BgAgentParamsSchema,
 	SubagentControlParamsSchema,
@@ -61,9 +53,7 @@ import type {
 	BgAgentParamsInput,
 	DisplayItem,
 	OnUpdateCallback,
-	RunStatus,
 	SingleResult,
-	StartBackgroundAgentResult,
 	SubagentControlParamsInput,
 	SubagentDetails,
 	SubagentMode,
@@ -255,38 +245,7 @@ function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["
 	}
 
 	container.addChild(new Text(line, 0, 0));
-	container.addChild(new Text(theme.fg("muted", `${SUBAGENT_PANEL_SHORTCUT_LABEL} to open subagent panel`), 0, 0));
 	return container;
-}
-
-type SubagentPanelTheme = ExtensionContext["ui"]["theme"];
-
-// ponytail: overlay render gets width only; maxHeight slices this into a tmux-like full-height column.
-const SUBAGENT_PANEL_FILL_ROWS = 500;
-
-const SUBAGENT_PANEL_OVERLAY_OPTIONS: OverlayOptions = {
-	anchor: "top-right",
-	width: "25%",
-	minWidth: 32,
-	maxHeight: "100%",
-	visible: (termWidth) => termWidth >= 100,
-	nonCapturing: true,
-};
-
-function resolveSubagentPanelWidth(termWidth: number): number {
-	const rawWidth = SUBAGENT_PANEL_OVERLAY_OPTIONS.width;
-	const percent = typeof rawWidth === "string" ? rawWidth.match(/^(\d+(?:\.\d+)?)%$/)?.[1] : undefined;
-	let width = typeof rawWidth === "number" ? rawWidth : Math.floor((termWidth * Number(percent ?? 25)) / 100);
-	width = Math.max(width, SUBAGENT_PANEL_OVERLAY_OPTIONS.minWidth ?? 1);
-	return Math.max(1, Math.min(width, termWidth - 1));
-}
-// ponytail: Ctrl+0 is flaky in some terminals; Ctrl+= is the non-IME fallback.
-const SUBAGENT_PANEL_SHORTCUTS = ["ctrl+0", "ctrl+="] as const;
-const SUBAGENT_PANEL_COMMAND = "subagent-panel";
-const SUBAGENT_PANEL_SHORTCUT_LABEL = `Ctrl+0/Ctrl+= or /${SUBAGENT_PANEL_COMMAND}`;
-
-function matchesSubagentPanelShortcut(data: string): boolean {
-	return SUBAGENT_PANEL_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
 }
 
 function formatPanelDuration(ms: number): string {
@@ -302,21 +261,6 @@ function formatRunTime(run: SubagentRun): string {
 	if (run.status === "queued" || run.status === "running") return formatPanelDuration(Date.now() - run.startedAt);
 	if (run.status === "completed") return "done";
 	return run.status;
-}
-
-function runStatusIcon(status: RunStatus, theme: SubagentPanelTheme): string {
-	switch (status) {
-		case "queued":
-			return theme.fg("dim", "○");
-		case "running":
-			return theme.fg("warning", "●");
-		case "completed":
-			return theme.fg("success", "✓");
-		case "failed":
-			return theme.fg("error", "✗");
-		case "aborted":
-			return theme.fg("muted", "⊘");
-	}
 }
 
 function capText(text: string, max = 12_000): string {
@@ -364,23 +308,6 @@ function buildFollowUpTask(run: SubagentRun, question: string, context: string |
 	].join("\n");
 }
 
-function splitPanelRow(left: string, right: string, width: number): string {
-	const rightWidth = visibleWidth(right);
-	if (rightWidth >= width) return truncateToWidth(right, width, "…", true);
-
-	const leftWidth = Math.max(0, width - rightWidth - 1);
-	const safeLeft = leftWidth > 0 ? truncateToWidth(left, leftWidth, "…") : "";
-	const gap = " ".repeat(Math.max(1, width - visibleWidth(safeLeft) - rightWidth));
-	return `${safeLeft}${gap}${right}`;
-}
-
-function panelTaskPreview(text: string | undefined): string {
-	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
-	return normalized || "...";
-}
-
-const subagentWidgetController = new SubagentWidgetController();
-const subagentPanelController = new SubagentPanelController();
 const subagentSchedulerController = new SubagentSchedulerController();
 
 export default function (pi: ExtensionAPI) {
@@ -389,8 +316,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionCwd = ctx.cwd;
-		subagentWidgetController.start(ctx);
-		subagentPanelController.start(ctx);
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
@@ -403,29 +328,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		subagentWidgetController.stop();
-		subagentPanelController.stop();
 		subagentSchedulerController.stop();
-	});
-
-	for (const shortcut of SUBAGENT_PANEL_SHORTCUTS) {
-		pi.registerShortcut(shortcut, {
-			description: "Toggle/focus subagent panel",
-			handler: (ctx) => {
-				subagentPanelController.toggleFocus(ctx);
-			},
-		});
-	}
-
-	pi.registerCommand(SUBAGENT_PANEL_COMMAND, {
-		description: "Toggle/focus the subagent side panel",
-		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") {
-				ctx.ui.notify("Subagent panel is only available in TUI mode.", "warning");
-				return;
-			}
-			subagentPanelController.toggleFocus(ctx);
-		},
 	});
 
 	pi.registerCommand("subagent-view", {
@@ -458,6 +361,34 @@ export default function (pi: ExtensionAPI) {
 				return ctx.ui.notify(deleted ? `Deleted schedule ${id}.` : `Unknown schedule: ${id}`, deleted ? "info" : "warning");
 			}
 			ctx.ui.notify(formatScheduleList(subagentSchedulerController.list()), "info");
+		},
+	});
+
+	pi.registerCommand("subagent-setting", {
+		description: "Configure default models for subagents",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") return ctx.ui.notify("/subagent-setting requires TUI mode.", "warning");
+
+			const agentScope: AgentScope = ctx.isProjectTrusted() ? "both" : "user";
+			const discovery = discoverAgents(ctx.cwd, agentScope);
+			if (discovery.agents.length === 0) return ctx.ui.notify("No subagents available.", "warning");
+
+			const scopes = (ctx.isProjectTrusted() ? ["global", "project"] : ["global"]) as ("global" | "project")[];
+			await ctx.ui.custom<void>(
+				(tui, theme, _keybindings, done) =>
+					new SubagentSettingsComponent({
+						tui,
+						theme,
+						agents: discovery.agents,
+						scopes,
+						initialDefaults: getAgentModelDefaults(ctx.cwd, ctx.isProjectTrusted()),
+						modelRegistry: ctx.modelRegistry,
+						save: async (scope, agentName, modelRef) => shortenPath(await setAgentModelDefault(ctx.cwd, scope, agentName, modelRef)),
+						refreshDefaults: () => getAgentModelDefaults(ctx.cwd, ctx.isProjectTrusted()),
+						onDone: done,
+					}),
+				{ overlay: true, overlayOptions: { anchor: "center", width: "75%", minWidth: 70, maxHeight: "85%" } },
+			);
 		},
 	});
 
@@ -501,7 +432,7 @@ export default function (pi: ExtensionAPI) {
 			if (!question) return { content: [{ type: "text", text: "action=ask requires question." }], details: { action, runId: run.id } };
 
 			const agentScope: AgentScope = params.agentScope ?? (run.agentSource === "project" ? "both" : "user");
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
 			const agents = discovery.agents;
 			const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			let fallbackThinkingLevel: string | undefined;
@@ -576,7 +507,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args: BgAgentParamsInput, theme) {
-			const agentName = args.agent || "scout";
+			const agentName = args.agent || "explorer";
 			return new Text(
 				`${theme.fg("warning", "⏳")} ${theme.fg("toolTitle", theme.bold("bg_agent "))}${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.prompt, 72))}`,
 				0,
@@ -653,14 +584,14 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use subagent for focused codebase reconnaissance, implementation planning, or independent code review when isolation helps.",
 			"Use subagent parallel mode for read-only research/review tasks; avoid parallel subagents that edit the same files.",
-			"Use subagent chain mode with {previous} to pass scout findings to planner or reviewer output to worker.",
+			"Use subagent chain mode with {previous} to pass explorer findings to planner or reviewer output to worker.",
 		],
 		parameters: SubagentParamsSchema as never,
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			const params = rawParams as SubagentParamsInput;
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
 			const agents = discovery.agents;
 			const mode = getMode(params);
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -943,7 +874,6 @@ export default function (pi: ExtensionAPI) {
 				if (expanded) return new Text(text, 0, 0);
 				const container = new Container();
 				container.addChild(new Text(text, 0, 0));
-				container.addChild(new Text(theme.fg("muted", `${SUBAGENT_PANEL_SHORTCUT_LABEL} to open subagent panel`), 0, 0));
 				return container;
 			}
 

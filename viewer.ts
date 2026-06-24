@@ -3,9 +3,9 @@ import { matchesKey, truncateToWidth, type Component, type OverlayOptions, type 
 import { getFinalOutput } from "./results.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import { subagentRunStore } from "./store.ts";
-import type { AgentMessage, RunStatus, SubagentRun, TextContent, ToolCallContent, UsageStats } from "./types.ts";
+import type { RunStatus, SubagentRun, TextContent, ToolCallContent, UsageStats } from "./types.ts";
 
-type SubagentPanelTheme = ExtensionContext["ui"]["theme"];
+type RunViewerTheme = ExtensionContext["ui"]["theme"];
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -42,7 +42,7 @@ function formatRunTime(run: SubagentRun): string {
 	return run.status;
 }
 
-function runStatusIcon(status: RunStatus, theme: SubagentPanelTheme): string {
+function runStatusIcon(status: RunStatus, theme: RunViewerTheme): string {
 	switch (status) {
 		case "queued": return theme.fg("dim", "○");
 		case "running": return theme.fg("warning", "●");
@@ -52,7 +52,7 @@ function runStatusIcon(status: RunStatus, theme: SubagentPanelTheme): string {
 	}
 }
 
-function panelTaskPreview(text: string | undefined): string {
+function taskPreview(text: string | undefined): string {
 	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
 	return normalized || "...";
 }
@@ -114,7 +114,7 @@ class SubagentRunViewerComponent implements Component {
 
 	constructor(
 		private readonly tui: TUI,
-		private readonly theme: SubagentPanelTheme,
+		private readonly theme: RunViewerTheme,
 		private readonly runId: string,
 		private readonly done: () => void,
 		private readonly stopRun: (runId: string) => void,
@@ -153,7 +153,7 @@ class SubagentRunViewerComponent implements Component {
 		} else {
 			const usage = formatUsageStats(run.usage, run.model);
 			lines.push(this.row(`${runStatusIcon(run.status, this.theme)} ${this.theme.fg("muted", `${formatShortRunId(run.id)} ${run.id}`)} ${this.theme.fg("accent", run.agent)} ${this.theme.fg("dim", run.status)} ${this.theme.fg("dim", formatRunTime(run))}`, innerW));
-			lines.push(this.row(`${this.theme.fg("muted", "task: ")}${this.theme.fg("dim", panelTaskPreview(run.task))}`, innerW));
+			lines.push(this.row(`${this.theme.fg("muted", "task: ")}${this.theme.fg("dim", taskPreview(run.task))}`, innerW));
 			if (run.currentTool) lines.push(this.row(`${this.theme.fg("muted", "tool: ")}${this.theme.fg("toolOutput", run.currentTool)}`, innerW));
 			if (usage) lines.push(this.row(`${this.theme.fg("muted", "usage: ")}${this.theme.fg("dim", usage)}`, innerW));
 		}

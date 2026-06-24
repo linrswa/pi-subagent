@@ -96,7 +96,7 @@ export class SubagentRunStore {
 			try {
 				subscriber(snapshot);
 			} catch {
-				// Keep store updates isolated from panel/render subscriber failures.
+				// Keep store updates isolated from subscriber failures.
 			}
 		}
 	}
