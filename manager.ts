@@ -156,6 +156,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		agentName,
 		fallbackModel,
 		fallbackThinkingLevel,
+		params.ponytailMode,
 		task,
 		params.cwd,
 		undefined,
@@ -184,7 +185,11 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 }
 
 export class SubagentManager {
-	constructor(private readonly pi: ExtensionAPI) {}
+	private readonly pi: ExtensionAPI;
+
+	constructor(pi: ExtensionAPI) {
+		this.pi = pi;
+	}
 
 	listRuns(): SubagentRun[] {
 		return subagentRunStore.getSnapshot();

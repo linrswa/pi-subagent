@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
-import { type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentScope, discoverAgents, normalizePonytailMode } from "./agents.ts";
 import { MAX_DATE_MS, MAX_TIMER_DELAY_MS } from "./constants.ts";
 import { chooseBackgroundAgent, confirmProjectAgentIfNeeded, normalizeAgentRef, type SubagentManager } from "./manager.ts";
 import { formatShortRunId } from "./run-refs.ts";
@@ -80,8 +80,11 @@ function parseSubagentSchedule(spec: string): { ok: true; parsed: ParsedSchedule
 	return { ok: false, message: "Schedule must be 30s/5m/1h/2d, +10m, an ISO timestamp, or a 6-field cron." };
 }
 
+const GENERATED_SCHEDULE_ID_RE = /^schedule-([a-z0-9]+-[a-z0-9]{4})$/i;
+
 export function formatScheduleId(id: string): string {
-	return `@${id.replace(/^schedule-/, "").slice(0, 13)}`;
+	const match = id.match(GENERATED_SCHEDULE_ID_RE);
+	return match ? match[1].slice(0, 13) : id;
 }
 
 export function formatRelativeTime(timestamp: number | undefined): string {
@@ -105,9 +108,11 @@ export function formatRelativeTime(timestamp: number | undefined): string {
 }
 
 function findScheduleByRef(ref: string | undefined, jobs: readonly SubagentScheduleJob[]): SubagentScheduleJob | undefined {
-	const wanted = ref?.trim().replace(/^@/, "");
+	const wanted = ref?.trim();
 	if (!wanted) return undefined;
-	return jobs.find((job) => job.id === ref || job.id === wanted || formatScheduleId(job.id).slice(1) === wanted || job.id.includes(wanted));
+	const exact = jobs.find((job) => job.id === wanted || formatScheduleId(job.id) === wanted);
+	if (exact) return exact;
+	return jobs.find((job) => GENERATED_SCHEDULE_ID_RE.test(job.id) && (job.id.includes(wanted) || formatScheduleId(job.id).includes(wanted)));
 }
 
 export function formatScheduleList(jobs: readonly SubagentScheduleJob[]): string {
@@ -116,7 +121,8 @@ export function formatScheduleList(jobs: readonly SubagentScheduleJob[]): string
 		.map((job) => {
 			const next = job.nextRunAt && job.nextRunAt <= MAX_DATE_MS ? `${new Date(job.nextRunAt).toISOString()} (${formatRelativeTime(job.nextRunAt)})` : "unscheduled";
 			const last = job.lastRunAt ? `\n  last: ${new Date(job.lastRunAt).toISOString()}${job.lastRunId ? ` ${formatShortRunId(job.lastRunId)}` : ""}` : "";
-			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "explorer"} [${job.agentScope}]\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
+			const ponytail = job.ponytailMode ? `\n  ponytail: ${job.ponytailMode}` : "";
+			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "explorer"} [${job.agentScope}]${ponytail}\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
 		})
 		.join("\n\n");
 }
@@ -194,21 +200,25 @@ export class SubagentSchedulerController {
 	async add(params: SubagentScheduleParamsInput): Promise<{ ok: true; job: SubagentScheduleJob } | { ok: false; message: string }> {
 		const schedule = params.schedule?.trim();
 		const prompt = params.prompt?.trim();
+		const name = params.name?.trim();
 		if (!schedule) return { ok: false, message: "action=add requires schedule." };
 		if (!prompt) return { ok: false, message: "action=add requires prompt." };
+		if (name && /[\r\n]/.test(name)) return { ok: false, message: "Schedule name cannot contain newlines." };
+		if (name && this.list().some((job) => job.id === name || formatScheduleId(job.id) === name)) return { ok: false, message: `Schedule id already exists: ${name}.` };
 		const parsed = parseSubagentSchedule(schedule);
 		if (parsed.ok === false) return { ok: false, message: parsed.message };
 		const approved = await this.confirmProjectAgent(params);
 		if (approved !== true) return { ok: false, message: approved };
 
 		const job: SubagentScheduleJob = {
-			id: `schedule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+			id: name || `schedule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
 			schedule,
 			kind: parsed.parsed.kind,
 			prompt,
 			agent: normalizeAgentRef(params.agent),
 			agentScope: params.agentScope ?? "user",
 			cwd: params.cwd,
+			ponytailMode: normalizePonytailMode(params.ponytailMode),
 			createdAt: Date.now(),
 			intervalMs: parsed.parsed.intervalMs,
 			nextRunAt: parsed.parsed.nextRunAt,
@@ -291,6 +301,7 @@ export class SubagentSchedulerController {
 			agentScope: job.agentScope,
 			confirmProjectAgents: false,
 			cwd: job.cwd,
+			ponytailMode: job.ponytailMode,
 		});
 		if (this.generation !== generation || this.jobs.get(id) !== job || this.ctx !== ctx || this.manager !== manager) return;
 		if (result.ok === true) {
@@ -323,7 +334,7 @@ export class SubagentSchedulerController {
 				if (job.kind === "interval" && (!job.intervalMs || job.intervalMs <= 0)) continue;
 				if (job.kind === "once" && !job.nextRunAt) continue;
 				const agentScope: AgentScope = job.agentScope === "project" || job.agentScope === "both" ? job.agentScope : "user";
-				loaded.set(job.id, { ...job, kind: job.kind, agentScope } as SubagentScheduleJob);
+				loaded.set(job.id, { ...job, kind: job.kind, agentScope, ponytailMode: normalizePonytailMode(job.ponytailMode) } as SubagentScheduleJob);
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.ctx?.ui.notify(`Failed to load subagent schedules: ${error instanceof Error ? error.message : String(error)}`, "warning");

@@ -1,3 +1,9 @@
+const PonytailModeSchema = {
+	type: "string",
+	enum: ["off", "lite", "full", "ultra"],
+	description: "Override PONYTAIL_DEFAULT_MODE for this child pi process. Omit to inherit the parent environment or agent default.",
+} as const;
+
 const TaskItemSchema = {
 	type: "object",
 	required: ["agent", "task"],
@@ -5,6 +11,7 @@ const TaskItemSchema = {
 		agent: { type: "string", description: "Name of the agent to invoke" },
 		task: { type: "string", description: "Task to delegate to the agent" },
 		cwd: { type: "string", description: "Working directory for the agent process" },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;
 
@@ -15,6 +22,7 @@ const ChainItemSchema = {
 		agent: { type: "string", description: "Name of the agent to invoke" },
 		task: { type: "string", description: "Task with optional {previous} placeholder for prior output" },
 		cwd: { type: "string", description: "Working directory for the agent process" },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;
 
@@ -46,6 +54,7 @@ export const SubagentParamsSchema = {
 			description: "Prompt before running project-local agents. Default: true.",
 		},
 		cwd: { type: "string", description: "Working directory for the agent process (single mode)" },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;
 
@@ -68,6 +77,7 @@ export const SubagentControlParamsSchema = {
 			description: "Agent discovery scope for action=ask. Defaults to user, or both for project-origin runs.",
 		},
 		cwd: { type: "string", description: "Optional cwd for action=ask. Defaults to the original run cwd." },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;
 
@@ -89,6 +99,7 @@ export const BgAgentParamsSchema = {
 			description: "Prompt before running project-local agents. Default: true.",
 		},
 		cwd: { type: "string", description: "Working directory for the background agent process." },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;
 
@@ -102,10 +113,12 @@ export const SubagentScheduleParamsSchema = {
 			description: "Schedule action. add creates a job, list shows jobs, delete removes one.",
 		},
 		id: { type: "string", description: "Schedule id for delete." },
+		name: { type: "string", description: "Optional unique schedule id to use when adding a job." },
 		schedule: { type: "string", description: "30s/5m/1h/2d interval, +10m one-shot, ISO timestamp, or 6-field cron." },
 		prompt: { type: "string", description: "Prompt/task to run when the schedule fires." },
 		agent: { type: "string", description: "Agent name. Defaults to explorer when available." },
 		agentScope: { type: "string", enum: ["user", "project", "both"], default: "user" },
 		cwd: { type: "string", description: "Working directory for scheduled background runs." },
+		ponytailMode: PonytailModeSchema,
 	},
 } as const;

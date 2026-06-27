@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents.ts";
+import { normalizePonytailMode, type AgentConfig, type PonytailMode } from "./agents.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import type { AgentMessage, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
@@ -56,6 +56,10 @@ function resolveChildCwd(defaultCwd: string, cwd: string | undefined): string {
 	return cwd ? path.resolve(defaultCwd, cwd) : defaultCwd;
 }
 
+export function getChildEnv(ponytailMode: PonytailMode | undefined): NodeJS.ProcessEnv | undefined {
+	return ponytailMode ? { ...process.env, PONYTAIL_DEFAULT_MODE: ponytailMode } : undefined;
+}
+
 export async function runSingleAgent(
 	mode: SubagentMode,
 	defaultCwd: string,
@@ -63,6 +67,7 @@ export async function runSingleAgent(
 	agentName: string,
 	fallbackModel: string | undefined,
 	fallbackThinkingLevel: string | undefined,
+	ponytailMode: PonytailMode | undefined,
 	task: string,
 	cwd: string | undefined,
 	step: number | undefined,
@@ -74,6 +79,7 @@ export async function runSingleAgent(
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
 	const agent = agents.find((candidate) => candidate.name === agentName);
 	const selectedModel = agent?.model ?? fallbackModel;
+	const selectedPonytailMode = normalizePonytailMode(ponytailMode) ?? agent?.ponytailMode;
 	const run = subagentRunStore.create({
 		mode,
 		agent: agentName,
@@ -82,6 +88,7 @@ export async function runSingleAgent(
 		step,
 		cwd: runCwd,
 		model: selectedModel,
+		ponytailMode: selectedPonytailMode,
 	});
 	onRunCreated?.(run);
 
@@ -97,6 +104,7 @@ export async function runSingleAgent(
 			messages: [],
 			stderr: errorMessage,
 			usage: makeEmptyUsage(),
+			ponytailMode: selectedPonytailMode,
 			errorMessage,
 			step,
 		};
@@ -130,6 +138,7 @@ export async function runSingleAgent(
 		stderr: "",
 		usage: makeEmptyUsage(),
 		model: selectedModel,
+		ponytailMode: selectedPonytailMode,
 		step,
 	};
 
@@ -141,6 +150,7 @@ export async function runSingleAgent(
 			messages: currentResult.messages,
 			usage: currentResult.usage,
 			model: currentResult.model,
+			ponytailMode: currentResult.ponytailMode,
 			finalOutput: finalOutput || undefined,
 			errorMessage: currentResult.errorMessage || undefined,
 			...patch,
@@ -181,8 +191,10 @@ export async function runSingleAgent(
 			let buffer = "";
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 
+			const childEnv = getChildEnv(selectedPonytailMode);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: runCwd,
+				...(childEnv ? { env: childEnv } : {}),
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});

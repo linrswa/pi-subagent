@@ -26,12 +26,13 @@ name: my-agent
 description: What this subagent is good at
 tools: read, grep, find, ls
 model: claude-haiku-4-5  # optional; omitted agents inherit the parent session model
+ponytailMode: ultra      # optional; overrides PONYTAIL_DEFAULT_MODE for this child pi process
 ---
 
 System prompt for the agent goes here.
 ```
 
-User agents override bundled agents with the same name. Project agents override both when project scope is enabled.
+User agents override bundled agents with the same name. Project agents override both when project scope is enabled. `ponytailMode` accepts `off`, `lite`, `full`, or `ultra`; per-call values override agent frontmatter, omitted values inherit the parent environment.
 
 ## Per-agent model defaults
 
@@ -57,7 +58,7 @@ Use `/subagent-setting` in TUI mode for a floating picker with fuzzy agent/model
 Single:
 
 ```json
-{ "agent": "reviewer", "task": "Review the current git diff" }
+{ "agent": "reviewer", "task": "Review the current git diff", "ponytailMode": "ultra" }
 ```
 
 Parallel:
@@ -86,7 +87,7 @@ Chain:
 Background:
 
 ```json
-{ "prompt": "Find likely causes of flaky auth tests", "agent": "explorer" }
+{ "prompt": "Find likely causes of flaky auth tests", "agent": "explorer", "ponytailMode": "lite" }
 ```
 
 Or type `/bg explorer Find likely causes of flaky auth tests`; `/bg` autocompletes agent names.
@@ -101,10 +102,10 @@ Viewer:
 Scheduling:
 
 ```json
-{ "action": "add", "schedule": "30m", "prompt": "Check for flaky test clues", "agent": "explorer" }
+{ "action": "add", "name": "flaky-check", "schedule": "30m", "prompt": "Check for flaky test clues", "agent": "explorer", "ponytailMode": "off" }
 ```
 
-`schedule` accepts recurring intervals (`30s`, `5m`, `1h`, `2d`), one-shot relatives (`+10m`), ISO timestamps, or 6-field cron. Jobs are stored under `.pi/subagent-schedules/<session>.json`; list/delete with `subagent_schedule` or `/subagent-schedules [delete] <id>`.
+`name` is optional; when set, it becomes the schedule id. `schedule` accepts recurring intervals (`30s`, `5m`, `1h`, `2d`), one-shot relatives (`+10m`), ISO timestamps, or 6-field cron. Jobs are stored under `.pi/subagent-schedules/<session>.json`; list/delete with `subagent_schedule` or `/subagent-schedules [delete] <id>`.
 
 ## Security notes
 

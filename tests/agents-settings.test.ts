@@ -1,9 +1,34 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { discoverAgentsWithSettings, setAgentModelDefault } from "../agents.ts";
+
+test("project agent frontmatter can set ponytail mode", async () => {
+	const cwd = await mkdtemp(path.join(tmpdir(), "pi-subagent-test-"));
+	try {
+		const agentsDir = path.join(cwd, ".pi", "agents");
+		await mkdir(agentsDir, { recursive: true });
+		await writeFile(
+			path.join(agentsDir, "pony.md"),
+			`---
+name: pony
+description: ponytail test
+tools: read
+ponytailMode: Ultra
+---
+
+Test agent.
+`,
+		);
+
+		const discovery = discoverAgentsWithSettings(cwd, "project", true);
+		assert.equal(discovery.agents.find((agent) => agent.name === "pony")?.ponytailMode, "ultra");
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test("project agent model defaults override and clear", async () => {
 	const cwd = await mkdtemp(path.join(tmpdir(), "pi-subagent-test-"));

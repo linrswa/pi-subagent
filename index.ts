@@ -345,9 +345,9 @@ export default function (pi: ExtensionAPI) {
 		description: "List/delete subagent schedules: /subagent-schedules [delete] <id>",
 		getArgumentCompletions: (prefix) => {
 			const jobs = subagentSchedulerController.list();
-			const query = prefix.trim().replace(/^delete\s+/, "").replace(/^@/, "");
+			const query = prefix.trim().replace(/^delete\s+/, "");
 			const items = jobs
-				.filter((job) => !query || job.id.includes(query) || formatScheduleId(job.id).slice(1).includes(query))
+				.filter((job) => !query || job.id.includes(query) || formatScheduleId(job.id).includes(query))
 				.map((job) => ({ value: formatScheduleId(job.id), label: formatScheduleId(job.id), description: `${job.schedule}: ${compactPreview(job.prompt, 80)}` }));
 			return items.length ? items : null;
 		},
@@ -457,6 +457,7 @@ export default function (pi: ExtensionAPI) {
 				params.agent ?? run.agent,
 				fallbackModel,
 				fallbackThinkingLevel,
+				params.ponytailMode ?? run.ponytailMode,
 				buildFollowUpTask(run, question, params.context),
 				params.cwd ?? run.cwd,
 				undefined,
@@ -529,6 +530,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Use subagent_schedule to add/list/delete scheduled background subagent runs for the current session.",
 		promptGuidelines: [
 			"Use action=add with schedule and prompt to start future background subagents.",
+			"When the user names a schedule, set name; it becomes the schedule id.",
 			"Scheduled runs use bg_agent/startBackgroundAgent with confirmProjectAgents=false.",
 			"Use action=list before delete if the schedule id is unclear.",
 		],
@@ -560,7 +562,8 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args: SubagentScheduleParamsInput, theme) {
 			const action = args.action ?? "list";
-			const target = action === "add" ? `${args.schedule ?? "?"}: ${compactPreview(args.prompt, 60)}` : (args.id ?? "");
+			const name = args.name ? `${args.name} ` : "";
+			const target = action === "add" ? `${name}${args.schedule ?? "?"}: ${compactPreview(args.prompt, 60)}` : (args.id ?? "");
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_schedule "))}${theme.fg("accent", action)} ${theme.fg("dim", target)}`, 0, 0);
 		},
 
@@ -676,6 +679,7 @@ export default function (pi: ExtensionAPI) {
 						step.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
+						step.ponytailMode ?? params.ponytailMode,
 						taskWithContext,
 						step.cwd,
 						i + 1,
@@ -717,6 +721,7 @@ export default function (pi: ExtensionAPI) {
 					messages: [],
 					stderr: "",
 					usage: makeEmptyUsage(),
+					ponytailMode: task.ponytailMode ?? params.ponytailMode,
 				}));
 
 				const emitParallelUpdate = () => {
@@ -736,6 +741,7 @@ export default function (pi: ExtensionAPI) {
 						task.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
+						task.ponytailMode ?? params.ponytailMode,
 						task.task,
 						task.cwd,
 						undefined,
@@ -775,6 +781,7 @@ export default function (pi: ExtensionAPI) {
 					params.agent,
 					fallbackModel,
 					fallbackThinkingLevel,
+					params.ponytailMode,
 					params.task,
 					params.cwd,
 					undefined,
