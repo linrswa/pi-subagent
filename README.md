@@ -1,42 +1,145 @@
 # Pi Subagent
 
-Pi package that registers subagent tools, bundled agents, and prompt templates.
+A Pi package for delegating work to isolated child Pi agents. It registers subagent tools, bundled agents, background runs, scheduled runs, and workflow prompt templates.
 
+## Features
 
-Pi extension that registers a `subagent` tool for delegating focused work to isolated child pi processes.
-
-## What it provides
-
-- `subagent` tool with single, parallel, and chain modes
-- `bg_agent` tool and `/bg [agent] <prompt>` command for non-blocking background runs
-- Live run viewer via `/subagent-view <runId>` or `&1` refs
-- `subagent_schedule` tool and `/subagent-schedules` command for session-scoped scheduled background runs
+- `subagent` tool: single, parallel, and chained child-agent runs
+- `bg_agent` tool and `/bg` command for non-blocking background runs
+- `subagent_control` tool for list/status/ask/stop/delete on existing runs
+- `subagent_schedule` tool and `/subagent-schedules` command for session-scoped schedules
+- Live run viewer via `/subagent-view <runId>` or `&1` run references
 - Bundled agents: `explorer`, `planner`, `reviewer`, `worker`
-- Optional user agents from `~/.pi/agent/agents/*.md`
-- Optional project agents from `.pi/agents/*.md` when `agentScope` is `both` or `project`
+- User agents from `~/.pi/agent/agents/*.md`
+- Project agents from `.pi/agents/*.md` when `agentScope` is `both` or `project`
 - Prompt templates: `/implement`, `/explorer-and-plan`, `/implement-and-review`
-- `/subagents [user|project|both]` command to list available agents
-- `/subagent-setting` command to set default models per agent
+- Per-agent model defaults via settings or `/subagent-setting`
 
-## Agent definition
+## Install
+
+From this directory:
+
+```bash
+npm install
+pi install "$(pwd)"
+```
+
+Temporary, without adding it to settings:
+
+```bash
+pi -e "$(pwd)"
+```
+
+After editing the package during development, use `/reload` in Pi.
+
+## Quick start
+
+```text
+Use the explorer subagent to find where auth sessions are created.
+```
+
+Or call the tool directly:
+
+```json
+{ "agent": "explorer", "task": "Find where auth sessions are created" }
+```
+
+Chained workflow:
+
+```json
+{
+  "chain": [
+    { "agent": "explorer", "task": "Find code relevant to Redis session caching" },
+    { "agent": "planner", "task": "Create an implementation plan from this context: {previous}" },
+    { "agent": "worker", "task": "Implement this plan: {previous}" }
+  ]
+}
+```
+
+Parallel read-only exploration:
+
+```json
+{
+  "tasks": [
+    { "agent": "explorer", "task": "Find auth code" },
+    { "agent": "explorer", "task": "Find session storage code" }
+  ]
+}
+```
+
+Background run:
+
+```text
+/bg explorer Find likely causes of flaky auth tests
+```
+
+Then inspect it with:
+
+```json
+{ "action": "status", "runId": "&1" }
+```
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `subagent` | Run one agent, parallel agents, or a chain with `{previous}` handoff. |
+| `bg_agent` | Start a background agent and return immediately with a run id. |
+| `subagent_control` | List, inspect, ask follow-up, stop, or delete existing runs. |
+| `subagent_schedule` | Add/list/delete scheduled background agents for the current session. |
+
+### `subagent` modes
+
+| Mode | Shape |
+|---|---|
+| Single | `{ "agent": "reviewer", "task": "Review the current diff" }` |
+| Parallel | `{ "tasks": [{ "agent": "explorer", "task": "..." }] }` |
+| Chain | `{ "chain": [{ "agent": "explorer", "task": "..." }, { "agent": "planner", "task": "Use {previous}" }] }` |
+
+Optional fields: `cwd`, `agentScope`, `confirmProjectAgents`, and `ponytailMode` (`off`, `lite`, `full`, `ultra`).
+
+## Commands and prompt templates
+
+| Command | Description |
+|---|---|
+| `/bg [agent] <prompt>` | Start a background agent. |
+| `/subagents [user\|project\|both]` | List available agents. |
+| `/subagent-view <runId>` | Open a live run viewer. |
+| `/subagent-schedules [delete] <id>` | List or delete schedules. |
+| `/subagent-setting` | Pick default models for agents in TUI mode. |
+| `/implement <task>` | `explorer → planner → worker`. |
+| `/explorer-and-plan <task>` | `explorer → planner`, no implementation. |
+| `/implement-and-review <task>` | `worker → reviewer → worker`. |
+
+Run refs like `&1` can be used in normal prompts; Pi injects the previous run context automatically.
+
+## Agents
+
+Agent definitions are Markdown files with YAML frontmatter:
 
 ```md
 ---
 name: my-agent
 description: What this subagent is good at
 tools: read, grep, find, ls
-model: claude-haiku-4-5  # optional; omitted agents inherit the parent session model
-ponytailMode: ultra      # optional; overrides PONYTAIL_DEFAULT_MODE for this child pi process
+model: anthropic/claude-haiku-4-5  # optional
+ponytailMode: ultra                # optional: off, lite, full, ultra
 ---
 
 System prompt for the agent goes here.
 ```
 
-User agents override bundled agents with the same name. Project agents override both when project scope is enabled. `ponytailMode` accepts `off`, `lite`, `full`, or `ultra`; per-call values override agent frontmatter, omitted values inherit the parent environment.
+Discovery order:
 
-## Per-agent model defaults
+1. Bundled agents in this package
+2. User agents in `~/.pi/agent/agents/*.md`
+3. Project agents in `.pi/agents/*.md` when enabled
 
-Set defaults in `~/.pi/agent/settings.json` or trusted `.pi/settings.json`:
+Later sources override earlier agents with the same `name`.
+
+## Model defaults
+
+Set defaults globally in `~/.pi/agent/settings.json` or per project in `.pi/settings.json`:
 
 ```json
 {
@@ -49,66 +152,34 @@ Set defaults in `~/.pi/agent/settings.json` or trusted `.pi/settings.json`:
 }
 ```
 
-Project settings override global settings. These defaults override agent frontmatter `model`; omitted agents inherit the parent session model.
+Project settings override global settings. These defaults override agent frontmatter `model`; agents without a model inherit the parent session model.
 
-Use `/subagent-setting` in TUI mode for a floating picker with fuzzy agent/model search and reasoning-level selection. It stays open after saves; press Esc from the agent list to close.
-
-## Tool modes
-
-Single:
-
-```json
-{ "agent": "reviewer", "task": "Review the current git diff", "ponytailMode": "ultra" }
-```
-
-Parallel:
+## Scheduling
 
 ```json
 {
-  "tasks": [
-    { "agent": "explorer", "task": "Find auth code" },
-    { "agent": "explorer", "task": "Find session code" }
-  ]
+  "action": "add",
+  "name": "flaky-check",
+  "schedule": "30m",
+  "prompt": "Check for flaky test clues",
+  "agent": "explorer"
 }
 ```
 
-Chain:
-
-```json
-{
-  "chain": [
-    { "agent": "explorer", "task": "Find relevant code for Redis session caching" },
-    { "agent": "planner", "task": "Plan the change using this context: {previous}" },
-    { "agent": "worker", "task": "Implement this plan: {previous}" }
-  ]
-}
-```
-
-Background:
-
-```json
-{ "prompt": "Find likely causes of flaky auth tests", "agent": "explorer", "ponytailMode": "lite" }
-```
-
-Or type `/bg explorer Find likely causes of flaky auth tests`; `/bg` autocompletes agent names.
-
-Use `&1` / `&2` to refer to existing subagent runs in normal prompts; press Tab after `&` for run completion.
-
-Viewer:
-
-- Run `/subagent-view &1`.
-- Keys: `j/k` or arrows scroll, `PageUp/PageDown`, `Home/End`, `q`/`Esc` close, `x` then `x` stop.
-
-Scheduling:
-
-```json
-{ "action": "add", "name": "flaky-check", "schedule": "30m", "prompt": "Check for flaky test clues", "agent": "explorer", "ponytailMode": "off" }
-```
-
-`name` is optional; when set, it becomes the schedule id. `schedule` accepts recurring intervals (`30s`, `5m`, `1h`, `2d`), one-shot relatives (`+10m`), ISO timestamps, or 6-field cron. Jobs are stored under `.pi/subagent-schedules/<session>.json`; list/delete with `subagent_schedule` or `/subagent-schedules [delete] <id>`.
+`schedule` accepts intervals (`30s`, `5m`, `1h`, `2d`), one-shot relatives (`+10m`), ISO timestamps, or 6-field cron. Schedules require a persisted Pi session and are stored under `.pi/subagent-schedules/<session>.json`.
 
 ## Security notes
 
-Project-local agents are repo-controlled prompts. The tool only loads them when `agentScope` is `both` or `project`, and it asks for confirmation in UI mode by default.
+Project-local agents are repo-controlled prompts. They are only loaded with `agentScope: "both"` or `"project"`, and TUI mode asks for confirmation by default.
 
-Child processes run with `--no-session` and `--exclude-tools subagent,bg_agent,subagent_schedule` to avoid persistent child sessions and recursive delegation.
+Child agents run as separate `pi --mode json -p --no-session` processes with `subagent`, `bg_agent`, and `subagent_schedule` excluded to prevent recursive delegation.
+
+## Development
+
+```bash
+npm install
+npm run check
+npm test
+```
+
+Useful limits: max 8 parallel tasks, 4 concurrent child processes, 50 KB model-visible output per parallel task.
