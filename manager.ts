@@ -272,9 +272,11 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 
 export class SubagentManager {
 	private readonly pi: ExtensionAPI;
+	private readonly onRunDeleted?: (run: SubagentRun) => void;
 
-	constructor(pi: ExtensionAPI) {
+	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void) {
 		this.pi = pi;
+		this.onRunDeleted = onRunDeleted;
 	}
 
 	listRuns(): SubagentRun[] {
@@ -290,7 +292,11 @@ export class SubagentManager {
 	}
 
 	deleteRun(runId: string): boolean {
-		return subagentRunStore.remove(runId);
+		const run = subagentRunStore.get(runId);
+		if (!run) return false;
+		const deleted = subagentRunStore.remove(runId, run.ownerSessionId);
+		if (deleted) this.onRunDeleted?.(run);
+		return deleted;
 	}
 
 	startBackground(ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {

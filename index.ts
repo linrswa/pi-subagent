@@ -43,6 +43,7 @@ import {
 	formatScheduleList,
 } from "./scheduler.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
+import { RunPointerPersistence } from "./run-pointers.ts";
 import { SubagentSettingsComponent } from "./settings-ui.ts";
 import { openSubagentRunViewer } from "./viewer.ts";
 import {
@@ -200,11 +201,22 @@ const subagentSchedulerController = new SubagentSchedulerController();
 
 export default function (pi: ExtensionAPI) {
 	let sessionCwd = process.cwd();
-	const subagentManager = new SubagentManager(pi);
+	const runPointers = new RunPointerPersistence(pi);
+	const subagentManager = new SubagentManager(pi, (run) => runPointers.tombstone(run.ownerSessionId, run.id));
+	// One observer sees all scopes. RunPointerPersistence rejects completions from
+	// background runs once their captured main-session generation is no longer active.
+	subagentRunStore.subscribeChanges((run) => runPointers.record(run));
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionCwd = ctx.cwd;
-		subagentRunStore.setActiveOwner(getMainSessionOwnerId(ctx));
+		const ownerSessionId = getMainSessionOwnerId(ctx);
+		subagentRunStore.setActiveOwner(ownerSessionId);
+		try {
+			runPointers.activate(ownerSessionId, ctx.sessionManager.getBranch(), subagentRunStore);
+		} catch {
+			// Ephemeral/no-session parents still retain their in-process run scope.
+			runPointers.activate(ownerSessionId, [], subagentRunStore);
+		}
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
@@ -217,6 +229,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		runPointers.deactivate();
 		subagentSchedulerController.stop();
 	});
 

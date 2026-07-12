@@ -15,6 +15,7 @@ export class SubagentRunStore {
 	private readonly nextRunNumbers = new Map<string, number>();
 	private readonly runs = new Map<string, SubagentRun>();
 	private readonly subscribers = new Map<SubagentRunSubscriber, string>();
+	private readonly changeSubscribers = new Set<(run: SubagentRun) => void>();
 
 	setActiveOwner(ownerSessionId: string): void {
 		this.activeOwnerSessionId = ownerSessionId;
@@ -39,6 +40,7 @@ export class SubagentRunStore {
 			ownerSessionId,
 		};
 		this.runs.set(this.key(ownerSessionId, run.id), this.cloneRun(run));
+		this.notifyChange(run);
 		this.notify();
 		return this.cloneRun(run);
 	}
@@ -50,6 +52,7 @@ export class SubagentRunStore {
 		if (!existing) return undefined;
 		const next: SubagentRun = { ...existing, ...patch, ownerSessionId: existing.ownerSessionId, messages: patch.messages ? [...patch.messages] : existing.messages, usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage };
 		this.runs.set(key, next);
+		this.notifyChange(next);
 		this.notify();
 		return this.cloneRun(next);
 	}
@@ -61,6 +64,20 @@ export class SubagentRunStore {
 
 	getSnapshot(ownerSessionId = this.activeOwnerSessionId): SubagentRun[] {
 		return Array.from(this.runs.values()).filter((run) => run.ownerSessionId === ownerSessionId).map((run) => this.cloneRun(run));
+	}
+
+	/** Observe creates/updates across scopes; persistence must still enforce its session guard. */
+	subscribeChanges(subscriber: (run: SubagentRun) => void): () => void {
+		this.changeSubscribers.add(subscriber);
+		return () => this.changeSubscribers.delete(subscriber);
+	}
+
+	/** Replace one owner scope with durable pointer records without re-persisting them. */
+	hydrate(ownerSessionId: string, runs: readonly SubagentRun[], maxRunNumber: number): void {
+		for (const [key, run] of this.runs) if (run.ownerSessionId === ownerSessionId) this.runs.delete(key);
+		for (const run of runs) this.runs.set(this.key(ownerSessionId, run.id), this.cloneRun({ ...run, ownerSessionId }));
+		this.nextRunNumbers.set(ownerSessionId, Math.max(1, maxRunNumber + 1));
+		this.notify();
 	}
 
 	subscribe(subscriber: SubagentRunSubscriber, ownerSessionId = this.activeOwnerSessionId): () => void {
@@ -86,6 +103,12 @@ export class SubagentRunStore {
 		return deleted;
 	}
 
+	private notifyChange(run: SubagentRun): void {
+		const snapshot = this.cloneRun(run);
+		for (const subscriber of this.changeSubscribers) {
+			try { subscriber(snapshot); } catch { /* isolate observers */ }
+		}
+	}
 	private key(ownerSessionId: string, id: string): string { return `${ownerSessionId}\u0000${id}`; }
 	private cloneRun(run: SubagentRun): SubagentRun { return { ...run, messages: [...run.messages], usage: cloneUsageStats(run.usage) }; }
 	private notify(): void {
