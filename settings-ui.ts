@@ -53,7 +53,10 @@ export class SubagentSettingsComponent implements Component, Focusable {
 	private status = "Enter selects; Esc exits; Tab toggles scope.";
 	private saving = false;
 
-	constructor(private readonly options: SubagentSettingsOptions) {
+	private readonly options: SubagentSettingsOptions;
+
+	constructor(options: SubagentSettingsOptions) {
+		this.options = options;
 		this.defaults = { ...options.initialDefaults };
 		this.filteredAgents = options.agents;
 		this.searchInput.focused = true;

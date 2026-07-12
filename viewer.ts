@@ -119,15 +119,20 @@ class SubagentRunViewerComponent implements Component {
 	private persistedMessages: SubagentRun["messages"] | undefined;
 	private loadedSessionFile: string | undefined;
 	private readonly unsubscribe: () => void;
+	private readonly tui: TUI;
+	private readonly theme: RunViewerTheme;
+	private readonly runId: string;
+	private readonly ownerSessionId: string;
+	private readonly done: () => void;
+	private readonly stopRun: (runId: string) => void;
 
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: RunViewerTheme,
-		private readonly runId: string,
-		private readonly ownerSessionId: string,
-		private readonly done: () => void,
-		private readonly stopRun: (runId: string) => void,
-	) {
+	constructor(tui: TUI, theme: RunViewerTheme, runId: string, ownerSessionId: string, done: () => void, stopRun: (runId: string) => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.runId = runId;
+		this.ownerSessionId = ownerSessionId;
+		this.done = done;
+		this.stopRun = stopRun;
 		this.unsubscribe = subagentRunStore.subscribe((runs) => {
 			this.run = runs.find((candidate) => candidate.id === runId && candidate.ownerSessionId === ownerSessionId);
 			if (this.run && this.run.status !== "running" && this.run.status !== "queued" && this.run.sessionFile && this.loadedSessionFile !== this.run.sessionFile) {

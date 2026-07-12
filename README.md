@@ -117,7 +117,7 @@ Run refs like `&1` can be used in normal prompts; Pi injects run metadata and to
 
 ### Child session retention and isolation
 
-Every child run has its own persisted Pi session under `<getAgentDir()>/subagent-sessions/<main-session-id>/`, outside the repository and Pi's normal `/resume` list. A continuation forks the source run's completed leaf into a new session file; it never writes to the source session. Multiple continuations from the same run are therefore isolated from one another.
+Every child run has its own persisted Pi session under `<getAgentDir()>/subagent-sessions/<main-session-or-runtime-id>/`, outside the repository and Pi's normal `/resume` list. A continuation forks the source run's completed leaf into a new session file; it never writes to the source session. Multiple continuations from the same run are therefore isolated from one another.
 
 Child history is kept in those managed session files for the viewer and continuation, not copied into the main agent's model context or tool-result details. The main agent receives only the child run's final answer and short status metadata. Use `{ "action": "delete", "runId": "&1" }` with `subagent_control` to remove a run and its managed child session when it is no longer needed. Deleting a parent does not remove already-created continuation sessions.
 
