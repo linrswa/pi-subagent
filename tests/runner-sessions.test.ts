@@ -6,6 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getChildSessionsRoot, readChildSessionMessages } from "../child-sessions.ts";
+import { getResultOutput, toParentResult } from "../results.ts";
 import { runSingleAgent } from "../runner.ts";
 import { subagentRunStore } from "../store.ts";
 import type { SubagentDetails } from "../types.ts";
@@ -122,6 +123,70 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		}
 		assert.notEqual(first.sessionId, second.sessionId);
 		assert.notEqual(first.sessionFile, second.sessionFile);
+	} finally {
+		process.argv[1] = originalScript;
+		await rm(temp, { recursive: true, force: true });
+		await rm(path.join(getChildSessionsRoot(), owner), { recursive: true, force: true });
+	}
+});
+
+test("process-level session lifecycle preserves source context, isolates siblings, and exposes only compact parent output", async () => {
+	const owner = `runner-lifecycle-${randomUUID()}`;
+	const temp = await mkdtemp(path.join(tmpdir(), "pi-subagent-lifecycle-"));
+	const script = path.join(temp, "fake-pi.mjs");
+	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const sourceTranscript = "SOURCE TRANSCRIPT: original investigation";
+	await writeFile(
+		script,
+		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
+const args = process.argv.slice(2);
+const value = (flag) => args[args.indexOf(flag) + 1];
+const task = args.at(-1);
+const manager = args.includes("--session")
+  ? SessionManager.open(value("--session"))
+  : SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
+const prior = manager.buildSessionContext().messages.map((message) => String(message.content));
+const answer = "answer: " + task + "; source-context=" + prior.some((content) => content.includes("SOURCE TRANSCRIPT")) + "; sibling-a-context=" + prior.some((content) => content.includes("follow up A"));
+manager.appendMessage({ role: "user", content: task, timestamp: Date.now() });
+manager.appendMessage({ role: "assistant", content: answer, provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" } }));
+`,
+	);
+	const originalScript = process.argv[1];
+	process.argv[1] = script;
+	try {
+		const run = (task: string, continueFrom?: { runId: string; sessionFile: string; leafId: string }) => runSingleAgent({
+			mode: "single", defaultCwd: process.cwd(),
+			agents: [{ name: "fake", description: "fake", systemPrompt: "", source: "user", filePath: script }],
+			agentName: "fake", task, ownerSessionId: owner, continueFrom, makeDetails,
+		});
+		const source = await run(sourceTranscript);
+		assert.ok(source.sessionFile, "a fresh run must persist a child session");
+		assert.ok(source.leafId);
+
+		const continuationSource = { runId: source.runId!, sessionFile: source.sessionFile, leafId: source.leafId };
+		const [first, second] = await Promise.all([
+			run("follow up A", continuationSource),
+			run("follow up B", continuationSource),
+		]);
+
+		assert.notEqual(first.sessionFile, source.sessionFile);
+		assert.notEqual(second.sessionFile, source.sessionFile);
+		assert.notEqual(first.sessionFile, second.sessionFile, "sibling continuations must fork independently");
+		const freshPrompt = `Task: ${sourceTranscript}`;
+		const sourceAnswer = `answer: ${freshPrompt}; source-context=false; sibling-a-context=false`;
+		for (const [result, task] of [[first, "follow up A"], [second, "follow up B"]] as const) {
+			const context = SessionManager.open(result.sessionFile!).buildSessionContext().messages.map((message) => message.content);
+			assert.deepEqual(context.slice(0, 2), [freshPrompt, sourceAnswer]);
+			assert.deepEqual(context.slice(2), [task, `answer: ${task}; source-context=true; sibling-a-context=false`]);
+		}
+
+		const parentDetails = toParentResult(second);
+		const parentContent = getResultOutput(second);
+		assert.equal(parentContent, parentDetails.finalOutput, "tool content is the continuation final answer");
+		assert.equal(parentContent.includes(sourceTranscript), false);
+		assert.equal(JSON.stringify(parentDetails).includes(sourceTranscript), false, "compact parent details exclude the source transcript");
+		assert.equal("messages" in parentDetails, false);
 	} finally {
 		process.argv[1] = originalScript;
 		await rm(temp, { recursive: true, force: true });

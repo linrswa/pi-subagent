@@ -94,6 +94,7 @@ Then inspect it with:
 |---|---|
 | Single | `{ "agent": "reviewer", "task": "Review the current diff" }` |
 | Continue | `{ "continueFrom": "&1", "task": "Review the previous result" }` |
+| Continue with agent override | `{ "continueFrom": "&1", "agent": "reviewer", "task": "Review the previous result" }` |
 | Parallel | `{ "tasks": [{ "agent": "explorer", "task": "..." }] }` |
 | Chain | `{ "chain": [{ "agent": "explorer", "task": "..." }, { "agent": "planner", "task": "Use {previous}" }] }` |
 
@@ -112,7 +113,17 @@ Optional fields: `cwd`, `agentScope`, and `confirmProjectAgents`.
 | `/explorer-and-plan <task>` | `explorer → planner`, no implementation. |
 | `/implement-and-review <task>` | `worker → reviewer → worker`. |
 
-Run refs like `&1` can be used in normal prompts; Pi injects run metadata and tool guidance, not the prior child conversation history. Use `continueFrom` to fork a completed run's persisted session for follow-up work.
+Run refs like `&1` can be used in normal prompts; Pi injects run metadata and tool guidance, not the prior child conversation history. Use `continueFrom` to fork a completed run's persisted session for follow-up work. Omitting `agent` reuses the source agent; supplying `agent` selects a different agent while retaining the source conversation. A continuation must use the source run's cwd.
+
+### Child session retention and isolation
+
+Every child run has its own persisted Pi session under `<getAgentDir()>/subagent-sessions/<main-session-id>/`, outside the repository and Pi's normal `/resume` list. A continuation forks the source run's completed leaf into a new session file; it never writes to the source session. Multiple continuations from the same run are therefore isolated from one another.
+
+Child history is kept in those managed session files for the viewer and continuation, not copied into the main agent's model context or tool-result details. The main agent receives only the child run's final answer and short status metadata. Use `{ "action": "delete", "runId": "&1" }` with `subagent_control` to remove a run and its managed child session when it is no longer needed. Deleting a parent does not remove already-created continuation sessions.
+
+### Main-session run scope and reloads
+
+Run list/status/control, `&N` refs and autocomplete, and `/subagent-view` are scoped to the current main Pi session. A different main session cannot inspect or continue its runs, and short IDs may repeat (both sessions can have `&1`). Returning to or reloading the same main session restores its run refs from minimal run-to-session pointers; those pointers contain session metadata only, never a child transcript. Deletion also records a retained tombstone pointer, so a deleted run is not restored after reload.
 
 ## Agents
 
@@ -170,7 +181,7 @@ Project settings override global settings. These defaults override agent frontma
 
 ## Security notes
 
-Project-local agents are repo-controlled prompts. They are only loaded with `agentScope: "both"` or `"project"`, and TUI mode asks for confirmation by default.
+Project-local agents are repo-controlled prompts. They are only loaded with `agentScope: "both"` or `"project"`, and TUI mode asks for confirmation by default, including when a continuation inherits or overrides to a project agent. Confirm only for trusted repositories.
 
 Child agents run in separate persisted managed Pi sessions, with `subagent`, `bg_agent`, and `subagent_schedule` excluded to prevent recursive delegation.
 
