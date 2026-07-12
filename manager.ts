@@ -6,7 +6,7 @@ import { cleanupChildSession, createFreshChildSession, getChildSessionOwnerId } 
 import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { OwnerRunLifecycle } from "./run-lifecycle.ts";
-import { subagentRunStore } from "./store.ts";
+import { subagentRunStore, type SubagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
 
@@ -285,15 +285,17 @@ export class SubagentManager {
 	private readonly pi: ExtensionAPI;
 	private readonly onRunDeleted?: (run: SubagentRun) => void;
 	private readonly lifecycle?: OwnerRunLifecycle;
+	private readonly store: SubagentRunStore;
 
-	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void, lifecycle?: OwnerRunLifecycle) {
+	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void, lifecycle?: OwnerRunLifecycle, store: SubagentRunStore = subagentRunStore) {
 		this.pi = pi;
 		this.onRunDeleted = onRunDeleted;
 		this.lifecycle = lifecycle;
+		this.store = store;
 	}
 
 	listRuns(): SubagentRun[] {
-		return subagentRunStore.getSnapshot();
+		return this.store.getSnapshot();
 	}
 
 	findRun(runId: string | undefined, runs = this.listRuns()): SubagentRun | undefined {
@@ -301,7 +303,7 @@ export class SubagentManager {
 	}
 
 	stopRun(runId: string): boolean {
-		return subagentRunStore.abort(runId);
+		return this.store.abort(runId);
 	}
 
 	/**
@@ -310,7 +312,7 @@ export class SubagentManager {
 	 * retry remains possible after a filesystem or safety-check failure.
 	 */
 	async deleteRun(runId: string): Promise<DeleteRunResult> {
-		const initialRun = subagentRunStore.get(runId);
+		const initialRun = this.store.get(runId);
 		if (!initialRun) return { deleted: false, message: "Unknown subagent run." };
 
 		const stopped = await this.stopForDeletion(initialRun.id, initialRun.ownerSessionId);
@@ -318,11 +320,11 @@ export class SubagentManager {
 		// Completion can discover sessionFile/leafId while an abort is in flight.
 		// Read the settled record so that file is retained neither accidentally nor
 		// by deleting a stale pre-abort descriptor.
-		const run = subagentRunStore.get(initialRun.id, initialRun.ownerSessionId);
+		const run = this.store.get(initialRun.id, initialRun.ownerSessionId);
 		if (!run) return { deleted: false, message: "Run disappeared while stopping it for deletion." };
 
 		if (run.sessionFile) {
-			const sharedFile = subagentRunStore.getSnapshot(run.ownerSessionId).some((other) =>
+			const sharedFile = this.store.getSnapshot(run.ownerSessionId).some((other) =>
 				other.id !== run.id && other.sessionFile === run.sessionFile,
 			);
 			if (sharedFile) {
@@ -338,19 +340,33 @@ export class SubagentManager {
 			}
 		}
 
-		const deleted = subagentRunStore.remove(run.id, run.ownerSessionId);
+		const deleted = this.store.remove(run.id, run.ownerSessionId);
 		if (!deleted) return { deleted: false, message: "Run disappeared before deletion could complete." };
 		this.onRunDeleted?.(run);
 		return { deleted: true };
 	}
 
 	private async stopForDeletion(runId: string, ownerSessionId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+		const initial = this.store.get(runId, ownerSessionId);
+		if (!initial) return { ok: false, message: "Run disappeared while stopping it for deletion." };
+		if (initial.endedAt !== undefined) return { ok: true };
+
+		// Hydrated pointers can still say queued/running, but their original
+		// extension runtime (and thus their abort handle) no longer exists. Do
+		// not spend the live-run timeout on those stale records: close them
+		// defensively before applying the normal managed-file safeguards.
+		const runtimeOwned = this.lifecycle ? this.lifecycle.owns(ownerSessionId, runId) : Boolean(initial.abort);
+		if (!runtimeOwned) {
+			this.store.update(runId, { status: "aborted", endedAt: Date.now(), abort: undefined }, ownerSessionId);
+			return { ok: true };
+		}
+
 		const deadline = Date.now() + 7_000;
 		while (Date.now() < deadline) {
-			const run = subagentRunStore.get(runId, ownerSessionId);
+			const run = this.store.get(runId, ownerSessionId);
 			if (!run) return { ok: false, message: "Run disappeared while stopping it for deletion." };
 			if (run.endedAt !== undefined) return { ok: true };
-			if (run.abort) run.abort();
+			run.abort?.();
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
 		return { ok: false, message: "Timed out waiting for the running subagent to stop; its session was not deleted." };

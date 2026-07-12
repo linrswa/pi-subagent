@@ -26,6 +26,11 @@ export class OwnerRunLifecycle {
 		(this.owners.get(run.ownerSessionId) ?? this.create(run.ownerSessionId)).runIds.add(run.id);
 	}
 
+	/** True only for work started by this extension runtime, never hydrated pointers. */
+	owns(ownerSessionId: string, runId: string): boolean {
+		return this.owners.get(ownerSessionId)?.runIds.has(runId) ?? false;
+	}
+
 	/** Abort this runtime's runs and leave persistence active until they settle. */
 	async shutdown(ownerSessionId: string, timeoutMs = SHUTDOWN_TIMEOUT_MS): Promise<boolean> {
 		const state = this.owners.get(ownerSessionId);

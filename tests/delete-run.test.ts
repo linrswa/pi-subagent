@@ -5,7 +5,8 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { branchChildSession, ensureChildSessionDir, getChildSessionsRoot } from "../child-sessions.ts";
 import { SubagentManager } from "../manager.ts";
-import { subagentRunStore } from "../store.ts";
+import { RUN_POINTER_ENTRY_TYPE, restoreRunPointers } from "../run-pointers.ts";
+import { SubagentRunStore, subagentRunStore } from "../store.ts";
 
 async function persistedSession(owner: string) {
 	const sessionDir = await ensureChildSessionDir(owner);
@@ -38,8 +39,10 @@ test("delete aborts a running run before cleaning only its own session and tombs
 		let aborted = false;
 		subagentRunStore.update(run.id, {
 			abort: () => {
+				if (aborted) return;
 				aborted = true;
-				subagentRunStore.update(run.id, { status: "aborted", endedAt: Date.now(), abort: undefined }, owner);
+				subagentRunStore.update(run.id, { status: "aborted", abort: undefined }, owner);
+				setTimeout(() => subagentRunStore.update(run.id, { endedAt: Date.now() }, owner), 35);
 			},
 		}, owner);
 		const manager = new SubagentManager({} as any, (deleted) => tombstones.push(deleted.id));
@@ -54,6 +57,36 @@ test("delete aborts a running run before cleaning only its own session and tombs
 		assert.equal(aborted, true);
 		assert.equal(subagentRunStore.get(run.id, owner), undefined);
 		assert.deepEqual(tombstones, [run.id]);
+		await assert.rejects(access(session.sessionFile));
+	} finally {
+		await rm(`${getChildSessionsRoot()}/${owner}`, { recursive: true, force: true });
+	}
+});
+
+test("deleting a hydrated stale running pointer cleans its session and tombstones promptly", async () => {
+	const owner = `delete-hydrated-${randomUUID()}`;
+	const store = new SubagentRunStore();
+	store.setActiveOwner(owner);
+	const tombstones: string[] = [];
+	try {
+		const session = await persistedSession(owner);
+		const restored = restoreRunPointers([{
+			type: "custom", customType: RUN_POINTER_ENTRY_TYPE,
+			data: {
+				version: 1, runId: "subagent-1", agent: "explorer", agentSource: "user", task: "interrupted",
+				status: "running", cwd: process.cwd(), sessionId: session.sessionId, sessionDir: session.sessionDir,
+				sessionFile: session.sessionFile, leafId: session.leafId, startedAt: Date.now(),
+			},
+		}], owner);
+		store.hydrate(owner, restored.runs, restored.maxRunNumber);
+		const manager = new SubagentManager({} as any, (deleted) => tombstones.push(deleted.id), undefined, store);
+
+		const started = Date.now();
+		const result = await manager.deleteRun("subagent-1");
+		assert.equal(result.deleted, true);
+		assert.ok(Date.now() - started < 1_000, "stale hydrated run should not wait for the live-run timeout");
+		assert.equal(store.get("subagent-1", owner), undefined);
+		assert.deepEqual(tombstones, ["subagent-1"]);
 		await assert.rejects(access(session.sessionFile));
 	} finally {
 		await rm(`${getChildSessionsRoot()}/${owner}`, { recursive: true, force: true });
