@@ -17,7 +17,7 @@ test("status requires a run id and renders only the selected detailed run", asyn
 	assert.match(implementation, /action=\$\{action\} requires runId/);
 	assert.match(implementation, /if \(action === "status"\) \{\s*return \{ content: \[\{ type: "text", text: formatRunDetails\(run\) \}\]/);
 	assert.doesNotMatch(implementation, /action === "status"\) \{\s*return \{ content: \[\{ type: "text", text: formatRunList\(runs\)/);
-	const controlBlock = implementation.split('name: "subagent_control"')[1].split('name: "bg_agent"')[0];
+	const controlBlock = implementation.split('name: "subagent_control"')[1].split('name: "subagent_schedule"')[0];
 	assert.doesNotMatch(controlBlock, /runSingleAgent\(/);
 });
 

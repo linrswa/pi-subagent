@@ -1,140 +1,193 @@
 # Pi Subagent
 
-A Pi package for delegating work to isolated child Pi agents. It registers subagent tools, bundled agents, background runs, scheduled runs, and workflow prompt templates.
+A Pi package for delegating work to isolated child Pi agents. It provides background-by-default runs, persisted child sessions, continuations, chains, scheduling, cancellation, and a live viewer.
 
 ## Features
 
-- `subagent` tool: single, continuation, parallel, and chained child-agent runs
-- `bg_agent` tool and `/bg` command for non-blocking background runs
-- `subagent_control` tool for list/status/stop/delete on existing runs
-- `subagent_schedule` tool and `/subagent-schedules` command for session-scoped schedules
-- Live run viewer via `/subagent-view <runId>` or `&1` run references
-- Bundled agents: `explorer`, `planner`, `reviewer`, `worker`
-- User agents from `~/.pi/agent/agents/*.md`
-- Project agents from `.pi/agents/*.md` when `agentScope` is `both` or `project`
-- Prompt templates: `/implement`, `/explorer-and-plan`, `/implement-and-review`
-- Per-agent model defaults via settings or `/subagent-setting`
+- `subagent` starts one child agent in background and immediately returns a run id
+- `wait: true` optionally waits for the final output
+- Multiple sibling `subagent` calls run concurrently through Pi's normal parallel tool execution
+- Process-wide FIFO queue with at most 4 child Pi processes running at once
+- Chained workflows with `{previous}` handoff and a cancellable parent run
+- Persisted child sessions and isolated continuation branches
+- `subagent_control` for list, status, stop, and delete
+- Session-scoped scheduled runs
+- Batched completion notifications delivered to the main session's next turn
+- Live viewer via `/subagent-view <runId>` or `&N` run references
+- Bundled agents: `explorer`, `planner`, `reviewer`, and `worker`
 
 ## Install
 
-From this directory:
+Install the pinned GitHub release:
 
 ```bash
+pi install git:github.com/linrswa/pi-subagent@v0.1.0
+```
+
+Try it for one Pi session without changing settings:
+
+```bash
+pi -e git:github.com/linrswa/pi-subagent@v0.1.0
+```
+
+Pi clones the tagged repository and runs `npm install` automatically because the package has runtime dependencies.
+
+For local development:
+
+```bash
+git clone https://github.com/linrswa/pi-subagent.git
+cd pi-subagent
 npm install
 pi install "$(pwd)"
 ```
 
-Temporary, without adding it to settings:
-
-```bash
-pi -e "$(pwd)"
-```
-
-After editing the package during development, use `/reload` in Pi.
+After editing a locally installed checkout, run `/reload` in Pi.
 
 ## Quick start
 
-```text
-Use the explorer subagent to find where auth sessions are created.
-```
-
-Or call the tool directly:
+Background run (default):
 
 ```json
-{ "agent": "explorer", "task": "Find where auth sessions are created" }
+{
+  "agent": "explorer",
+  "task": "Find where auth sessions are created"
+}
 ```
 
-Chained workflow:
+The tool immediately returns a reference such as `&1`. The main agent remains available while the child runs.
+
+Wait for the result when the current turn depends on it:
+
+```json
+{
+  "agent": "reviewer",
+  "task": "Review the current diff",
+  "wait": true
+}
+```
+
+`agent` is optional for a fresh run; `explorer` is preferred when available.
+
+## Migration from the previous API
+
+This release changes the default execution model:
+
+| Previous API | Current API |
+|---|---|
+| `bg_agent({ prompt, agent })` | `subagent({ task, agent })` |
+| `subagent({ agent, task })` waited for completion | Background by default; add `wait: true` to wait |
+| `subagent({ tasks: [...] })` | Emit multiple sibling `subagent` calls |
+| A chain waited for completion | Chain is background by default; add `wait: true` when needed |
+
+The `bg_agent` tool is no longer registered. The interactive `/bg` command remains as a convenience alias for starting one background run.
+
+Removed batch example:
+
+```json
+{
+  "tasks": [
+    { "agent": "explorer", "task": "Inspect auth" },
+    { "agent": "explorer", "task": "Inspect storage" }
+  ]
+}
+```
+
+Replace it with two sibling tool calls in the same assistant turn. Each run then receives an independent id and cancellation lifecycle.
+
+## Parallel work
+
+There is no `tasks` batch mode. Ask Pi to emit multiple sibling calls instead:
+
+```text
+Start three explorer subagents in parallel: inspect authentication, storage, and tests.
+```
+
+Each call receives its own run id and can be inspected or stopped independently. Pi executes sibling tool calls concurrently, while this package limits the whole process to 4 active child processes. Extra runs remain `queued` and can be stopped before spawning.
+
+Avoid concurrent agents which modify the same files. Child context and session history are isolated, but the workspace is currently shared.
+
+## Chains
 
 ```json
 {
   "chain": [
     { "agent": "explorer", "task": "Find code relevant to Redis session caching" },
-    { "agent": "planner", "task": "Create an implementation plan from this context: {previous}" },
+    { "agent": "planner", "task": "Create a plan from this context: {previous}" },
     { "agent": "worker", "task": "Implement this plan: {previous}" }
   ]
 }
 ```
 
-Parallel read-only exploration:
+A chain is background by default and immediately returns a synthetic parent run id. Stopping that parent stops the active child and prevents later steps from starting.
+
+Use `"wait": true` when the caller needs the final chain output immediately. The bundled `/implement`, `/explorer-and-plan`, and `/implement-and-review` templates do this.
+
+## Continuations
+
+Continue a fully closed run from its persisted child session:
 
 ```json
 {
-  "tasks": [
-    { "agent": "explorer", "task": "Find auth code" },
-    { "agent": "explorer", "task": "Find session storage code" }
-  ]
+  "continueFrom": "&1",
+  "task": "Now inspect the error paths"
 }
 ```
 
-Background run:
+Omitting `agent` reuses the source agent. Supplying another agent changes the role while retaining the source conversation. A continuation always uses the source run's cwd and forks its child session, so sibling continuations do not modify one another's history.
 
-```text
-/bg explorer Find likely causes of flaky auth tests
-```
-
-Then inspect it with:
-
-```json
-{ "action": "status", "runId": "&1" }
-```
-
-## Tools
+## Tools and commands
 
 | Tool | Purpose |
 |---|---|
-| `subagent` | Run one agent, continue a completed run, run parallel agents, or run a chain with `{previous}` handoff. |
-| `bg_agent` | Start a background agent and return immediately with a run id. |
-| `subagent_control` | List, inspect, stop, or delete existing runs. |
-| `subagent_schedule` | Add/list/delete scheduled background agents for the current session. |
+| `subagent` | Start a fresh run, continuation, or chain. Background by default; supports `wait: true`. |
+| `subagent_control` | List, inspect, stop, or delete runs. |
+| `subagent_schedule` | Add, list, or delete session-scoped schedules. |
 
-### `subagent` modes
-
-| Mode | Shape |
+| Command | Purpose |
 |---|---|
-| Single | `{ "agent": "reviewer", "task": "Review the current diff" }` |
-| Continue | `{ "continueFrom": "&1", "task": "Review the previous result" }` |
-| Continue with agent override | `{ "continueFrom": "&1", "agent": "reviewer", "task": "Review the previous result" }` |
-| Parallel | `{ "tasks": [{ "agent": "explorer", "task": "..." }] }` |
-| Chain | `{ "chain": [{ "agent": "explorer", "task": "..." }, { "agent": "planner", "task": "Use {previous}" }] }` |
-
-Optional fields: `cwd`, `agentScope`, and `confirmProjectAgents`.
-
-## Commands and prompt templates
-
-| Command | Description |
-|---|---|
-| `/bg [agent] <prompt>` | Start a background agent. |
+| `/bg [agent] <prompt>` | Convenience alias for a background single run. |
 | `/subagents [user\|project\|both]` | List available agents. |
-| `/subagent-view <runId>` | Open a live run viewer. |
+| `/subagent-view <runId>` | Open the live run viewer. |
 | `/subagent-schedules [delete] <id>` | List or delete schedules. |
-| `/subagent-setting` | Pick default models for agents in TUI mode. |
-| `/implement <task>` | `explorer → planner → worker`. |
-| `/explorer-and-plan <task>` | `explorer → planner`, no implementation. |
-| `/implement-and-review <task>` | `worker → reviewer → worker`. |
+| `/subagent-setting` | Configure per-agent model defaults. |
 
-Run refs like `&1` can be used in normal prompts; Pi injects run metadata and tool guidance, not the prior child conversation history. Use `continueFrom` to fork a completed run's persisted session for follow-up work. Omitting `agent` reuses the source agent; supplying `agent` selects a different agent while retaining the source conversation. A continuation must use the source run's cwd.
+Control examples:
 
-### Child session retention and isolation
+```json
+{ "action": "list" }
+{ "action": "status", "runId": "&1" }
+{ "action": "stop", "runId": "&1" }
+{ "action": "delete", "runId": "&1" }
+```
 
-Every child run has its own persisted Pi session under `<getAgentDir()>/subagent-sessions/<main-session-or-runtime-id>/`, outside the repository and Pi's normal `/resume` list. A continuation forks the source run's completed leaf into a new session file; it never writes to the source session. Multiple continuations from the same run are therefore isolated from one another.
+## Completion delivery
 
-Child history is kept in those managed session files for the viewer and continuation, not copied into the main agent's model context or tool-result details. The main agent receives only the child run's final answer and short status metadata. Use `{ "action": "delete", "runId": "&1" }` with `subagent_control` to remove a run and its managed child session when it is no longer needed. Deleting a parent does not remove already-created continuation sessions.
+Background terminal events are debounced and grouped for the UI. A bounded completion summary remains durably marked as pending in the main-session run pointer. On the next normal user input, the extension appends all pending summaries to that turn; it marks them delivered only when Pi accepts the prompt and starts the parent agent. This avoids unsolicited automatic turns and prevents an in-memory notification queue from being lost on reload.
 
-### Main-session run scope and reloads
+Full child transcripts stay in managed child-session files. Parent context receives only bounded completion summaries and run metadata.
 
-Run list/status/control, `&N` refs and autocomplete, and `/subagent-view` are scoped to the current main Pi session. A different main session cannot inspect or continue its runs, and short IDs may repeat (both sessions can have `&1`). Returning to or reloading the same main session restores its run refs from minimal run-to-session pointers; those pointers contain session metadata only, never a child transcript. Deletion also records a retained tombstone pointer, so a deleted run is not restored after reload.
+## Child session retention and scope
 
-## Agents
+Child sessions live under:
 
-Agent definitions are Markdown files with YAML frontmatter:
+```text
+<getAgentDir()>/subagent-sessions/<main-session-or-runtime-id>/
+```
+
+They are outside the repository and Pi's normal `/resume` list. Runs, `&N` references, control actions, and viewers are scoped to the current main Pi session. Reloading the same session restores minimal run pointers, not child transcripts.
+
+Deleting a run removes its managed child session after safety checks. Deleting a chain parent does not automatically delete already-created child runs or sessions.
+
+## Agent definitions
+
+Agents are Markdown files with YAML frontmatter:
 
 ```md
 ---
 name: my-agent
 description: What this subagent is good at
 tools: read, grep, find, ls
-model: anthropic/claude-haiku-4-5  # optional
+model: anthropic/claude-haiku-4-5
 ---
 
 System prompt for the agent goes here.
@@ -142,15 +195,15 @@ System prompt for the agent goes here.
 
 Discovery order:
 
-1. Bundled agents in this package
-2. User agents in `~/.pi/agent/agents/*.md`
-3. Project agents in `.pi/agents/*.md` when enabled
+1. Bundled agents
+2. `~/.pi/agent/agents/*.md`
+3. `.pi/agents/*.md` when `agentScope` is `project` or `both`
 
-Later sources override earlier agents with the same `name`.
+Later sources override earlier agents with the same name.
 
 ## Model defaults
 
-Set defaults globally in `~/.pi/agent/settings.json` or per project in `.pi/settings.json`:
+Configure globally in `~/.pi/agent/settings.json` or per project in `.pi/settings.json`:
 
 ```json
 {
@@ -163,7 +216,7 @@ Set defaults globally in `~/.pi/agent/settings.json` or per project in `.pi/sett
 }
 ```
 
-Project settings override global settings. These defaults override agent frontmatter `model`; agents without a model inherit the parent session model.
+Project settings override global settings. Agents without a configured or frontmatter model inherit the parent model.
 
 ## Scheduling
 
@@ -177,13 +230,15 @@ Project settings override global settings. These defaults override agent frontma
 }
 ```
 
-`schedule` accepts intervals (`30s`, `5m`, `1h`, `2d`), one-shot relatives (`+10m`), ISO timestamps, or 6-field cron. Schedules require a persisted Pi session and are stored under `.pi/subagent-schedules/<session>.json`.
+Schedules support intervals (`30s`, `5m`, `1h`, `2d`), relative one-shots (`+10m`), ISO timestamps, and six-field cron expressions. Scheduled runs use the same global child-process queue.
 
-## Security notes
+## Security and current workspace limitation
 
-Project-local agents are repo-controlled prompts. They are only loaded with `agentScope: "both"` or `"project"`, and TUI mode asks for confirmation by default, including when a continuation inherits or overrides to a project agent. Confirm only for trusted repositories.
+Project-local agents are repository-controlled prompts. They require `agentScope: "project"` or `"both"`, and interactive mode asks for confirmation by default.
 
-Child agents run in separate persisted managed Pi sessions, with `subagent`, `bg_agent`, and `subagent_schedule` excluded to prevent recursive delegation.
+Child agents cannot recursively call `subagent` or `subagent_schedule`.
+
+The current implementation isolates process context and Pi session history, but not source files: child processes use the selected `cwd`. Background agents that write to a shared workspace can conflict with the main agent or another child. A future workspace provider is planned in `workspace_provider_plan.md`.
 
 ## Development
 
@@ -193,4 +248,6 @@ npm run check
 npm test
 ```
 
-Useful limits: max 8 parallel tasks, 4 concurrent child processes, 50 KB model-visible output per parallel task.
+## License
+
+[MIT](LICENSE) © 2026 linrswa

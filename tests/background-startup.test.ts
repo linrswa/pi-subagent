@@ -6,7 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getChildSessionsRoot } from "../child-sessions.ts";
-import { startBackgroundAgent } from "../manager.ts";
+import { startAgent } from "../manager.ts";
 import { subagentRunStore } from "../store.ts";
 
 async function waitForTerminal(runId: string, ownerSessionId: string): Promise<void> {
@@ -28,7 +28,7 @@ test("background startup creates a managed run before the child completes", asyn
 		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
 const args = process.argv.slice(2);
 const value = (flag) => args[args.indexOf(flag) + 1];
-if (args.includes("--no-session") || value("--exclude-tools") !== "subagent,bg_agent,subagent_schedule") process.exit(2);
+if (args.includes("--no-session") || value("--exclude-tools") !== "subagent,subagent_schedule") process.exit(2);
 const manager = SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
 manager.appendMessage({ role: "user", content: "child task", timestamp: Date.now() });
 manager.appendMessage({ role: "assistant", content: "child answer", provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
@@ -51,19 +51,21 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		sessionManager: { getSessionId: () => owner },
 		ui: { notify: () => undefined },
 	} as any;
-	const result = await startBackgroundAgent({ getThinkingLevel: () => undefined } as any, ctx, {
-		prompt: "persist this",
+	const result = await startAgent({ getThinkingLevel: () => undefined } as any, ctx, {
+		task: "persist this",
 		agent: "explorer",
 	});
 
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
 	assert.equal(result.run.status, "queued");
-	assert.equal(result.run.sessionDir, path.join(getChildSessionsRoot(), owner));
-	assert.ok(result.run.sessionId);
+	assert.equal(result.run.sessionDir, undefined, "child-session setup continues after the background handle returns");
+	await result.completion;
 	await waitForTerminal(result.run.id, owner);
 	const run = subagentRunStore.get(result.run.id, owner)!;
 	assert.equal(run.status, "completed");
+	assert.equal(run.sessionDir, path.join(getChildSessionsRoot(), owner));
+	assert.ok(run.sessionId);
 	assert.ok(run.sessionFile);
 	assert.ok(run.leafId);
 });

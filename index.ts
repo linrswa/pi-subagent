@@ -2,8 +2,8 @@
  * Subagent Tool - delegate tasks to specialized pi agents with isolated context.
  *
  * Each invocation spawns one or more separate persisted `pi --mode json -p`
- * sessions. This keeps child context windows isolated while streaming progress
- * back into the parent tool result.
+ * sessions. Child context stays isolated; background runs publish through the
+ * run store/viewer, while wait=true can stream progress in the tool result.
  */
 
 import * as os from "node:os";
@@ -17,17 +17,15 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList, getAgentModelDefaults, setAgentModelDefault } from "./agents.ts";
-import {
-	MAX_CONCURRENCY,
-	MAX_PARALLEL_TASKS,
-} from "./constants.ts";
-import { getFinalOutput, getResultOutput, isFailedResult, toParentResult, truncateForParent } from "./results.ts";
+import { startChain } from "./chain-runner.ts";
+import { CompletionNotifier } from "./completion-notifier.ts";
+import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import {
 	SubagentManager,
 	buildRunRefContext,
 	formatRunDetails,
 	createRunRefAutocompleteProvider,
-	getBgAgentCompletions,
+	getAgentCommandCompletions,
 	getMainSessionOwnerId,
 	getMode,
 	getContinuationCallDisplay,
@@ -35,26 +33,23 @@ import {
 	normalizeAgentRef,
 } from "./manager.ts";
 import { formatShortRunId } from "./run-refs.ts";
-import { runSingleAgent, mapWithConcurrencyLimit } from "./runner.ts";
 import {
 	SubagentSchedulerController,
 	formatRelativeTime,
 	formatScheduleId,
 	formatScheduleList,
 } from "./scheduler.ts";
-import { makeEmptyUsage, subagentRunStore } from "./store.ts";
+import { subagentRunStore } from "./store.ts";
 import { RunPointerPersistence } from "./run-pointers.ts";
 import { OwnerRunLifecycle } from "./run-lifecycle.ts";
 import { SubagentSettingsComponent } from "./settings-ui.ts";
 import { openSubagentRunViewer } from "./viewer.ts";
 import {
-	BgAgentParamsSchema,
 	SubagentControlParamsSchema,
 	SubagentParamsSchema,
 	SubagentScheduleParamsSchema,
 } from "./schemas.ts";
 import type {
-	BgAgentParamsInput,
 	OnUpdateCallback,
 	ParentResult,
 	SingleResult,
@@ -121,7 +116,7 @@ function aggregateUsage(results: Array<Pick<SingleResult, "usage">>): Omit<Usage
 
 
 function resultIcon(result: ParentResult, theme: ExtensionContext["ui"]["theme"]): string {
-	if (result.status === "running") return theme.fg("warning", "⏳");
+	if (result.status === "queued" || result.status === "running") return theme.fg("warning", "⏳");
 	return result.status === "failed" || result.status === "aborted" ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
@@ -141,9 +136,8 @@ function resultStatusLabel(result: ParentResult): ParentResult["status"] {
 
 function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["ui"]["theme"]): Container {
 	const container = new Container();
-	const running = details.results.filter((entry) => entry.status === "running").length;
+	const running = details.results.filter((entry) => entry.status === "queued" || entry.status === "running").length;
 	const failed = details.results.filter((entry) => entry.status === "failed" || entry.status === "aborted").length;
-	const succeeded = details.results.filter((entry) => entry.status === "completed").length;
 	const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
 	const scope = theme.fg("muted", ` [${details.agentScope}]`);
 	let line: string;
@@ -152,12 +146,11 @@ function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["
 		const entry = details.results[0];
 		const continuation = formatContinuedFrom(entry.continuedFromRunId);
 		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scope}`;
-	} else if (details.mode === "parallel") {
-		const done = succeeded + failed;
-		const summary = running > 0 ? `${running} running, ${done} done` : `${succeeded}/${details.results.length} succeeded${failed ? `, ${failed} failed` : ""}`;
-		line = `${topIcon} ${theme.fg("accent", "subagents")}: ${theme.fg("dim", summary)}${scope}`;
+	} else if (details.chainStepCount && details.results[0]?.agent === "chain") {
+		const entry = details.results[0];
+		line = `${resultIcon(entry, theme)} ${theme.fg("accent", `chain (${details.chainStepCount} steps)`)}: ${theme.fg("dim", resultStatusLabel(entry))}${scope}`;
 	} else {
-		const runningIndex = details.results.findIndex((entry) => entry.status === "running");
+		const runningIndex = details.results.findIndex((entry) => entry.status === "queued" || entry.status === "running");
 		const failedIndex = details.results.findIndex((entry) => entry.status === "failed" || entry.status === "aborted");
 		const activeIndex = runningIndex !== -1 ? runningIndex : failedIndex !== -1 ? failedIndex : details.results.length - 1;
 		const entry = details.results[activeIndex];
@@ -192,7 +185,9 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 			const tool = run.currentTool ? `\n  current: ${run.currentTool}` : "";
 			const preview = output ? `\n  output: ${compactPreview(output, 180)}` : "";
 			const parent = run.continuedFromRunId ? `\n  ${formatContinuedFrom(run.continuedFromRunId)}` : "";
-			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent}${tool}${preview}`;
+			const chainParent = run.parentRunId ? `\n  chain parent: ${formatShortRunId(run.parentRunId)}` : "";
+			const children = run.childRunIds?.length ? `\n  child runs: ${run.childRunIds.map(formatShortRunId).join(", ")}` : "";
+			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent}${chainParent}${children}${tool}${preview}`;
 		})
 		.join("\n\n");
 }
@@ -204,7 +199,14 @@ export default function (pi: ExtensionAPI) {
 	let sessionCwd = process.cwd();
 	const runPointers = new RunPointerPersistence(pi);
 	const runLifecycle = new OwnerRunLifecycle();
-	const subagentManager = new SubagentManager(pi, (run) => runPointers.tombstone(run.ownerSessionId, run.id), runLifecycle);
+	const completionNotifier = new CompletionNotifier();
+	const subagentManager = new SubagentManager(
+		pi,
+		(run) => runPointers.tombstone(run.ownerSessionId, run.id),
+		runLifecycle,
+		subagentRunStore,
+		(run, completion) => completionNotifier.watch(run, completion),
+	);
 	// One observer sees all scopes. RunPointerPersistence rejects completions from
 	// background runs once their captured main-session generation is no longer active.
 	subagentRunStore.subscribeChanges((run) => runPointers.record(run));
@@ -222,22 +224,44 @@ export default function (pi: ExtensionAPI) {
 			// Ephemeral/no-session parents still retain their in-process run scope.
 			runPointers.activate(ownerSessionId, [], subagentRunStore);
 		}
+		completionNotifier.activate(ownerSessionId, ctx);
+		completionNotifier.resume(subagentRunStore.getSnapshot(ownerSessionId));
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
 
 	pi.on("input", (event) => {
-		if (event.source === "extension" || event.text.trimStart().startsWith("/")) return { action: "continue" };
-		const context = buildRunRefContext(event.text);
-		if (!context) return { action: "continue" };
-		return { action: "transform", text: `${event.text}\n\n${context}` };
+		// Steering/follow-up messages do not start a new agent run, and slash
+		// templates expand after this hook. Leave completions pending for the next
+		// ordinary idle prompt instead of duplicating or corrupting template args.
+		if (event.source === "extension" || event.streamingBehavior || event.text.trimStart().startsWith("/")) return { action: "continue" };
+		const ownerSessionId = subagentRunStore.getActiveOwner();
+		const completion = completionNotifier.stageForNextInput(ownerSessionId);
+		const runRefContext = buildRunRefContext(event.text);
+		const additions = [completion.content, runRefContext].filter((value): value is string => Boolean(value));
+		if (additions.length === 0) return { action: "continue" };
+		return { action: "transform", text: `${event.text}\n\n${additions.join("\n\n")}` };
+	});
+
+	pi.on("agent_start", (_event, ctx) => {
+		const ownerSessionId = getMainSessionOwnerId(ctx);
+		for (const run of completionNotifier.acknowledgeStaged(ownerSessionId)) runPointers.recordCurrent(run);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		const ownerSessionId = getMainSessionOwnerId(ctx);
+		// Runtime-aborted work must not reappear as a user-facing completion after
+		// reload. Already-terminal pending notifications remain resumable.
+		for (const run of subagentRunStore.getSnapshot(ownerSessionId)) {
+			if ((run.status === "queued" || run.status === "running") && run.completionNotification === "pending") {
+				subagentRunStore.update(run.id, { completionNotification: "suppressed" }, ownerSessionId);
+			}
+		}
+		completionNotifier.deactivate(ownerSessionId);
 		// Stop timers first. Keep pointer persistence active while runtime-owned
 		// children receive aborts and publish their terminal records.
 		subagentSchedulerController.stop();
-		await runLifecycle.shutdown(getMainSessionOwnerId(ctx));
+		await runLifecycle.shutdown(ownerSessionId);
 		runPointers.deactivate();
 	});
 
@@ -365,44 +389,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bg_agent",
-		label: "Background Agent",
-		description: "Start a subagent in the background and return immediately with a run id.",
-		promptSnippet: "Start a background subagent for work that should not block the main agent; returns a run id for subagent_control.",
-		promptGuidelines: [
-			"Use bg_agent when the user asks to run work in the background or when the main answer does not need the result before continuing.",
-			"Use subagent instead of bg_agent when the main agent must wait for the subagent result.",
-			"After bg_agent starts a run, use subagent_control list/status/stop/delete to inspect or control it, or subagent continueFrom for follow-up work.",
-		],
-		parameters: BgAgentParamsSchema as never,
-
-		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-			const result = await subagentManager.startBackground(ctx, rawParams as BgAgentParamsInput);
-			if (result.ok === false) return { content: [{ type: "text", text: result.message }], details: { ok: false } };
-			const id = formatShortRunId(result.run.id);
-			return {
-				content: [{ type: "text", text: `Started ${result.run.agent} ${id} in background. Use subagent_control with runId ${id} to inspect it.` }],
-				details: { ok: true, runId: result.run.id, agent: result.run.agent, agentScope: result.agentScope },
-			};
-		},
-
-		renderCall(args: BgAgentParamsInput, theme) {
-			const agentName = args.agent || "explorer";
-			return new Text(
-				`${theme.fg("warning", "⏳")} ${theme.fg("toolTitle", theme.bold("bg_agent "))}${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.prompt, 72))}`,
-				0,
-				0,
-			);
-		},
-
-		renderResult(result, _options, theme) {
-			const first = result.content?.[0];
-			const text = first?.type === "text" ? first.text : "(no output)";
-			return new Text(theme.fg("toolOutput", text), 0, 0);
-		},
-	});
-
-	pi.registerTool({
 		name: "subagent_schedule",
 		label: "Subagent Schedule",
 		description: "Session-scoped scheduled background subagents. Supports interval (30s/5m/1h/2d), relative one-shot (+10m), ISO timestamp, and 6-field cron.",
@@ -410,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use action=add with schedule and prompt to start future background subagents.",
 			"When the user names a schedule, set name; it becomes the schedule id.",
-			"Scheduled runs use bg_agent/startBackgroundAgent with confirmProjectAgents=false.",
+			"Scheduled runs start the subagent in background with project-agent confirmation disabled after schedule creation approval.",
 			"Use action=list before delete if the schedule id is unclear.",
 		],
 		parameters: SubagentScheduleParamsSchema as never,
@@ -457,15 +443,16 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate tasks to specialized subagents with isolated context windows.",
-			"Modes: single (agent + task), continuation (continueFrom + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Start specialized subagents with isolated context windows. Runs are background by default and return a run id immediately; set wait=true to return the final output.",
+			"Modes: single (optional agent + task), continuation (continueFrom + task), and chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (bundled agents + ~/.pi/agent/agents).',
 			'To enable repo-local .pi/agents, set agentScope: "both" or "project".',
 		].join(" "),
-		promptSnippet: "Delegate focused work to specialized subagents with isolated context; supports single, continuation from a completed run, parallel, and chained tasks.",
+		promptSnippet: "Start a focused child agent in background and return its run id; set wait=true only when the current turn needs the final result. Multiple sibling calls run concurrently.",
 		promptGuidelines: [
 			"Use subagent for focused codebase reconnaissance, implementation planning, or independent code review when isolation helps.",
-			"Use subagent parallel mode for read-only research/review tasks; avoid parallel subagents that edit the same files.",
+			"Runs are background by default. Do not poll; completion is delivered to the main session. Set wait=true only when the current turn cannot continue without the result.",
+			"For parallel work, emit multiple sibling subagent calls; Pi executes sibling tools concurrently. Avoid concurrent agents that edit the same files.",
 			"Use subagent chain mode with {previous} to pass explorer findings to planner or reviewer output to worker.",
 			"Continue a completed run with {continueFrom: \"&1\", task: \"...\"}; omit agent to reuse it, or provide agent to switch. Continuations retain the source cwd.",
 		],
@@ -475,6 +462,10 @@ export default function (pi: ExtensionAPI) {
 			const params = rawParams as SubagentParamsInput;
 			const mode = getMode(params);
 			const sourceRun = params.continueFrom ? subagentManager.findRun(params.continueFrom) : undefined;
+			// Capture before any project-agent confirmation can await. If the session
+			// shuts down during confirmation, this signal remains aborted.
+			const chainOwnerSessionId = mode === "chain" ? getMainSessionOwnerId(ctx) : undefined;
+			const chainSignal = chainOwnerSessionId ? runLifecycle.signalFor(chainOwnerSessionId, params.wait ? signal : undefined) : undefined;
 
 			if (mode && params.continueFrom && !sourceRun) {
 				return { content: [{ type: "text", text: `Unknown subagent run to continue: ${params.continueFrom}` }], details: { mode: "single", results: [] } };
@@ -533,7 +524,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode: {agent, task}, {continueFrom, task}, {tasks}, or {chain}.\n\nAvailable agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`,
+							text: `Invalid parameters. Provide exactly one mode: {task, agent?}, {continueFrom, task}, or {chain}.\n\nAvailable agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`,
 						},
 					],
 					details: makeDetails("single")([]),
@@ -553,10 +544,17 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			if (mode === "chain" && params.chain) {
+				const unknown = params.chain.find((step) => !agents.some((agent) => agent.name === step.agent));
+				if (unknown) {
+					const list = formatAgentList(agents);
+					return { content: [{ type: "text", text: `Unknown agent: "${unknown.agent}". Available agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}` }], details: makeDetails("chain")([]) };
+				}
+			}
+
+			if (mode === "chain" && (agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const task of params.tasks) requestedAgentNames.add(task.agent);
 				if (params.agent) requestedAgentNames.add(params.agent);
 				else if (sourceRun) requestedAgentNames.add(sourceRun.agent);
 
@@ -581,152 +579,83 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (mode === "chain" && params.chain) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
+				if (chainSignal?.aborted || !chainOwnerSessionId) return { content: [{ type: "text", text: "Canceled: session is shutting down." }], details: makeDetails("chain")([]) };
+				const handle = startChain({
+					defaultCwd: ctx.cwd,
+					agents,
+					steps: params.chain,
+					fallbackModel,
+					fallbackThinkingLevel,
+					agentScope,
+					ownerSessionId: chainOwnerSessionId,
+					completionNotification: params.wait ? "suppressed" : "pending",
+					signal: chainSignal,
+					onUpdate: params.wait ? (onUpdate as OnUpdateCallback | undefined) : undefined,
+					makeDetails: makeDetails("chain"),
+					onParentCreated: (run) => runLifecycle.track(run),
+					onChildCreated: (run) => runLifecycle.track(run),
+				});
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								const currentResult = partial.details?.results[0];
-								if (!currentResult) return;
-								onUpdate({ content: partial.content, details: makeDetailsFromParent("chain")([...results.map(toParentResult), currentResult]) });
-							}
-						: undefined;
-
-					const result = await runSingleAgent({
-						mode: "chain",
-						defaultCwd: ctx.cwd,
-						agents,
-						agentName: step.agent,
-						fallbackModel,
-						fallbackThinkingLevel,
-						task: taskWithContext,
-						cwd: step.cwd,
-						step: i + 1,
-						agentScope,
-						ownerSessionId: getMainSessionOwnerId(ctx),
-						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
-						onRunCreated: (run) => runLifecycle.track(run),
-						onUpdate: chainUpdate,
-						makeDetails: makeDetails("chain"),
-					});
-					results.push(result);
-
-					if (isFailedResult(result)) {
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${getResultOutput(result)}` }],
-							details: makeDetails("chain")(results),
-						};
-					}
-
-					previousOutput = getFinalOutput(result.messages);
-				}
-
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (mode === "parallel" && params.tasks) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS) {
+				if (!params.wait) {
+					completionNotifier.watch(handle.run, handle.completion);
+					const id = formatShortRunId(handle.run.id);
 					return {
-						content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
-						details: makeDetails("parallel")([]),
+						content: [{ type: "text", text: `Started chain ${id} in background. Use subagent_control with runId ${id} to inspect or stop it.` }],
+						details: { ...makeDetailsFromParent("chain")([{
+							runId: handle.run.id,
+							agent: handle.run.agent,
+							status: handle.run.status,
+							finalOutput: "",
+							usage: handle.run.usage,
+						}]), chainStepCount: params.chain.length },
 					};
 				}
 
-				const allResults: SingleResult[] = params.tasks.map((task) => ({
-					agent: task.agent,
-					agentSource: "unknown",
-					task: task.task,
-					exitCode: -1,
-					messages: [],
-					stderr: "",
-					usage: makeEmptyUsage(),
-				}));
-
-				const allResultDetails = allResults.map(toParentResult);
-				const emitParallelUpdate = () => {
-					const running = allResults.filter((result) => result.exitCode === -1).length;
-					const done = allResults.length - running;
-					onUpdate?.({
-						content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
-						details: makeDetailsFromParent("parallel")([...allResultDetails]),
-					});
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (task, index) => {
-					const result = await runSingleAgent({
-						mode: "parallel",
-						defaultCwd: ctx.cwd,
-						agents,
-						agentName: task.agent,
-						fallbackModel,
-						fallbackThinkingLevel,
-						task: task.task,
-						cwd: task.cwd,
-						agentScope,
-						ownerSessionId: getMainSessionOwnerId(ctx),
-						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
-						onRunCreated: (run) => runLifecycle.track(run),
-						onUpdate: (partial) => {
-							if (partial.details?.results[0]) {
-								allResultDetails[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails: makeDetails("parallel"),
-					});
-					allResults[index] = result;
-					allResultDetails[index] = toParentResult(result);
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((result) => !isFailedResult(result)).length;
-				const summaries = results.map((result) => {
-					const status = isFailedResult(result)
-						? `failed${result.stopReason && result.stopReason !== "end" ? ` (${result.stopReason})` : ""}`
-						: "completed";
-					return `### [${result.agent}] ${status}\n\n${truncateForParent(getResultOutput(result))}`;
-				});
-
+				const completed = await handle.completion;
 				return {
-					content: [{ type: "text", text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}` }],
-					details: makeDetails("parallel")(results),
+					content: [{ type: "text", text: completed.finalOutput }],
+					details: makeDetails("chain")(completed.results),
 				};
 			}
 
-			if (mode === "single" && params.task && (params.agent || sourceRun)) {
-				try {
-					const result = await runSingleAgent({
-						mode: "single",
-						defaultCwd: ctx.cwd,
-						agents,
-						agentName: params.agent ?? sourceRun!.agent,
-						fallbackModel,
-						fallbackThinkingLevel,
-						task: params.task,
-						cwd: sourceRun?.cwd ?? params.cwd,
-						agentScope,
-						ownerSessionId: getMainSessionOwnerId(ctx),
-						continueFrom: sourceRun ? { runId: sourceRun.id, sessionFile: sourceRun.sessionFile!, leafId: sourceRun.leafId! } : undefined,
-						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
-						onRunCreated: (run) => runLifecycle.track(run),
-						onUpdate: onUpdate as OnUpdateCallback | undefined,
-						makeDetails: makeDetails("single"),
-					});
+			if (mode === "single" && params.task) {
+				const started = await subagentManager.startAgent(ctx, {
+					task: params.task,
+					agent: params.agent,
+					agentScope,
+					confirmProjectAgents,
+					cwd: params.cwd,
+					sourceRun,
+					signal: params.wait ? signal : undefined,
+					onUpdate: params.wait ? (onUpdate as OnUpdateCallback | undefined) : undefined,
+				}, !params.wait);
+				if (started.ok === false) return { content: [{ type: "text", text: started.message }], details: makeDetails("single")([]) };
 
+				if (!params.wait) {
+					const id = formatShortRunId(started.run.id);
+					return {
+						content: [{ type: "text", text: `Started ${started.run.agent} ${id} in background. Use subagent_control with runId ${id} to inspect or stop it.` }],
+						details: makeDetailsFromParent("single")([{
+							runId: started.run.id,
+							agent: started.run.agent,
+							status: started.run.status,
+							finalOutput: "",
+							usage: started.run.usage,
+							model: started.run.model,
+							continuedFromRunId: started.run.continuedFromRunId,
+						}]),
+					};
+				}
+
+				try {
+					const result = await started.completion;
 					return {
 						content: [{ type: "text", text: isFailedResult(result) ? `Agent failed: ${getResultOutput(result)}` : getResultOutput(result) }],
 						details: makeDetails("single")([result]),
 					};
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					return { content: [{ type: "text", text: `Cannot continue ${sourceRun ? formatShortRunId(sourceRun.id) : "subagent"}: ${message}` }], details: makeDetails("single")([]) };
+					return { content: [{ type: "text", text: `Subagent failed: ${message}` }], details: makeDetails("single")([]) };
 				}
 			}
 
@@ -746,14 +675,6 @@ export default function (pi: ExtensionAPI) {
 					const firstStep = args.chain[0];
 					return new Text(
 						`${theme.fg("warning", "⏳")} ${theme.fg("accent", `chain (${args.chain.length} steps)`)}: ${theme.fg("dim", firstStep.agent)}${scopeSuffix}`,
-						0,
-						0,
-					);
-				}
-
-				if (args.tasks && args.tasks.length > 0) {
-					return new Text(
-						`${theme.fg("warning", "⏳")} ${theme.fg("accent", "subagents")}: ${theme.fg("dim", `${args.tasks.length} tasks`)}${scopeSuffix}`,
 						0,
 						0,
 					);
@@ -780,19 +701,6 @@ export default function (pi: ExtensionAPI) {
 					text += `\n  ${theme.fg("muted", `${i + 1}.`)} ${theme.fg("accent", step.agent)}${theme.fg("dim", ` ${preview}`)}`;
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${callDisplay.agentScope}]`);
-				for (const task of args.tasks.slice(0, 3)) {
-					const preview = task.task.length > 48 ? `${task.task.slice(0, 48)}...` : task.task;
-					text += `\n  ${theme.fg("accent", task.agent)}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
 			}
 
@@ -826,7 +734,7 @@ export default function (pi: ExtensionAPI) {
 			const mdTheme = getMarkdownTheme();
 			const container = new Container();
 			const modeLabel = details.mode === "single" ? details.results[0]?.agent : details.mode;
-			const running = details.results.filter((entry) => entry.status === "running").length;
+			const running = details.results.filter((entry) => entry.status === "queued" || entry.status === "running").length;
 			const failed = details.results.filter((entry) => entry.status === "failed" || entry.status === "aborted").length;
 			const succeeded = details.results.filter((entry) => entry.status === "completed").length;
 			const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
@@ -834,9 +742,11 @@ export default function (pi: ExtensionAPI) {
 			const topStatus =
 				details.mode === "single"
 					? `${modeLabel ?? "subagent"}${continuation ? ` (${continuation})` : ""}`
-					: running > 0
-						? `${succeeded + failed}/${details.results.length} done, ${running} running`
-						: `${succeeded}/${details.results.length} succeeded`;
+					: details.chainStepCount
+						? `chain (${details.chainStepCount} steps) ${details.results[0]?.status ?? "running"}`
+						: running > 0
+							? `${succeeded + failed}/${details.results.length} done, ${running} running`
+							: `${succeeded}/${details.results.length} succeeded`;
 
 			container.addChild(
 				new Text(
@@ -858,7 +768,7 @@ export default function (pi: ExtensionAPI) {
 					container.addChild(new Spacer(1));
 					container.addChild(new Markdown(entry.finalOutput.trim(), 0, 0, mdTheme));
 				} else {
-					container.addChild(new Text(theme.fg("muted", entry.status === "running" ? "(running...)" : "(no output)"), 0, 0));
+					container.addChild(new Text(theme.fg("muted", entry.status === "queued" || entry.status === "running" ? "(running...)" : "(no output)"), 0, 0));
 				}
 				const usage = formatUsageStats(entry.usage, entry.model);
 				if (usage) container.addChild(new Text(theme.fg("dim", usage), 0, 0));
@@ -879,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("bg", {
 		description: "Start a background subagent: /bg [agent] <prompt>",
-		getArgumentCompletions: (prefix) => getBgAgentCompletions(sessionCwd, prefix),
+		getArgumentCompletions: (prefix) => getAgentCommandCompletions(sessionCwd, prefix),
 		handler: async (args, ctx) => {
 			let text = args.trim();
 			if (!text && ctx.hasUI) text = (await ctx.ui.input("Background agent", "Prompt"))?.trim() ?? "";
@@ -890,7 +800,7 @@ export default function (pi: ExtensionAPI) {
 			const firstAgent = normalizeAgentRef(firstWord);
 			const agent = firstAgent && restWords.length > 0 && discovery.agents.some((candidate) => candidate.name === firstAgent) ? firstAgent : undefined;
 			const prompt = agent ? restWords.join(" ") : text;
-			const result = await subagentManager.startBackground(ctx, { prompt, agent });
+			const result = await subagentManager.startAgent(ctx, { task: prompt, agent });
 			if (result.ok === false) return ctx.ui.notify(result.message, "warning");
 
 			ctx.ui.notify(`Started ${result.run.agent} ${formatShortRunId(result.run.id)} in background.`, "info");

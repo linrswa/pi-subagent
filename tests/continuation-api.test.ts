@@ -9,11 +9,13 @@ import type { SubagentRun } from "../types.ts";
 
 test("continuation API exposes its schema and permits only single mode", () => {
 	assert.ok("continueFrom" in SubagentParamsSchema.properties);
+	assert.ok("wait" in SubagentParamsSchema.properties);
+	assert.equal("tasks" in SubagentParamsSchema.properties, false);
 	assert.equal(getMode({ agent: "explorer", task: "x" }), "single");
 	assert.equal(getMode({ continueFrom: "&1", task: "x" }), "single");
 	assert.equal(getMode({ continueFrom: "&1", agent: "reviewer", task: "x" }), "single");
 	assert.equal(getMode({ continueFrom: "&1" }), undefined);
-	assert.equal(getMode({ continueFrom: "&1", task: "x", tasks: [] }), undefined);
+	assert.equal(getMode({ continueFrom: "&1", task: "x", tasks: [] } as any), undefined);
 	assert.equal(getMode({ continueFrom: "&1", task: "x", chain: [] }), undefined);
 });
 

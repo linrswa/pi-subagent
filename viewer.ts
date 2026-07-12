@@ -80,7 +80,9 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 			const tool = run.currentTool ? `\n  current: ${run.currentTool}` : "";
 			const preview = output ? `\n  output: ${compactPreview(output, 180)}` : "";
 			const parent = formatParentRun(run);
-			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent ? `\n  ${parent}` : ""}${tool}${preview}`;
+			const chainParent = run.parentRunId ? `\n  chain parent: ${formatShortRunId(run.parentRunId)}` : "";
+			const children = run.childRunIds?.length ? `\n  child runs: ${run.childRunIds.map(formatShortRunId).join(", ")}` : "";
+			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent ? `\n  ${parent}` : ""}${chainParent}${children}${tool}${preview}`;
 		})
 		.join("\n\n");
 }
@@ -180,6 +182,8 @@ class SubagentRunViewerComponent implements Component {
 			lines.push(this.row(`${this.theme.fg("muted", "session id: ")}${this.theme.fg("dim", run.sessionId ?? "(none)")}`, innerW));
 			const parent = formatParentRun(run);
 			if (parent) lines.push(this.row(`${this.theme.fg("muted", "parent run: ")}${this.theme.fg("dim", parent)}`, innerW));
+			if (run.parentRunId) lines.push(this.row(`${this.theme.fg("muted", "chain parent: ")}${this.theme.fg("dim", `${formatShortRunId(run.parentRunId)} (${run.parentRunId})`)}`, innerW));
+			if (run.childRunIds?.length) lines.push(this.row(`${this.theme.fg("muted", "child runs: ")}${this.theme.fg("dim", run.childRunIds.map(formatShortRunId).join(", "))}`, innerW));
 			if (run.currentTool) lines.push(this.row(`${this.theme.fg("muted", "tool: ")}${this.theme.fg("toolOutput", run.currentTool)}`, innerW));
 			if (usage) lines.push(this.row(`${this.theme.fg("muted", "usage: ")}${this.theme.fg("dim", usage)}`, innerW));
 		}

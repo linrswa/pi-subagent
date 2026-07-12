@@ -1,16 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentScope, AgentSource } from "./agents.ts";
 import { makeEmptyUsage, type SubagentRunStore } from "./store.ts";
-import type { RunStatus, SubagentRun } from "./types.ts";
+import type { CompletionNotificationState, RunStatus, SubagentMode, SubagentRun } from "./types.ts";
 
 export const RUN_POINTER_ENTRY_TYPE = "pi-subagent.run";
 export const RUN_TOMBSTONE_ENTRY_TYPE = "pi-subagent.run-tombstone";
 const POINTER_VERSION = 1;
+const COMPLETION_SUMMARY_MAX_CHARS = 500;
+
+function compactCompletionSummary(run: SubagentRun): string | undefined {
+	if (run.status === "queued" || run.status === "running") return undefined;
+	const text = (run.finalOutput || run.errorMessage || "").trim();
+	if (!text) return undefined;
+	return text.length > COMPLETION_SUMMARY_MAX_CHARS ? `${text.slice(0, COMPLETION_SUMMARY_MAX_CHARS)}...` : text;
+}
 
 /** Deliberately only a child-session pointer, never a child transcript or result. */
 export interface RunPointer {
 	version: 1;
 	runId: string;
+	mode?: SubagentMode;
 	agent: string;
 	agentSource: AgentSource | "unknown";
 	agentScope?: AgentScope;
@@ -22,6 +31,10 @@ export interface RunPointer {
 	sessionFile?: string;
 	leafId?: string;
 	continuedFromRunId?: string;
+	parentRunId?: string;
+	childRunIds?: string[];
+	completionNotification?: CompletionNotificationState;
+	completionSummary?: string;
 	startedAt: number;
 	endedAt?: number;
 }
@@ -31,10 +44,13 @@ type EntryLike = { type?: unknown; customType?: unknown; data?: unknown };
 
 export function toRunPointer(run: SubagentRun): RunPointer {
 	return {
-		version: POINTER_VERSION, runId: run.id, agent: run.agent, agentSource: run.agentSource,
+		version: POINTER_VERSION, runId: run.id, mode: run.mode, agent: run.agent, agentSource: run.agentSource,
 		agentScope: run.agentScope, task: run.task, status: run.status, cwd: run.cwd,
 		sessionId: run.sessionId, sessionDir: run.sessionDir, sessionFile: run.sessionFile,
 		leafId: run.leafId, continuedFromRunId: run.continuedFromRunId,
+		parentRunId: run.parentRunId, childRunIds: run.childRunIds,
+		completionNotification: run.completionNotification,
+		completionSummary: compactCompletionSummary(run),
 		startedAt: run.startedAt, endedAt: run.endedAt,
 	};
 }
@@ -48,8 +64,13 @@ function asPointer(data: unknown): RunPointer | undefined {
 	const value = data as Record<string, unknown>;
 	const validSource = value.agentSource === "package" || value.agentSource === "user" || value.agentSource === "project" || value.agentSource === "unknown";
 	const validScope = value.agentScope === undefined || value.agentScope === "user" || value.agentScope === "project" || value.agentScope === "both";
-	if (value.version !== POINTER_VERSION || typeof value.runId !== "string" || typeof value.agent !== "string" || typeof value.task !== "string" || !validSource || !validScope || !isStatus(value.status) || typeof value.startedAt !== "number") return undefined;
-	return value as unknown as RunPointer;
+	const validMode = value.mode === undefined || value.mode === "single" || value.mode === "chain";
+	const validParent = value.parentRunId === undefined || typeof value.parentRunId === "string";
+	const validChildren = value.childRunIds === undefined || (Array.isArray(value.childRunIds) && value.childRunIds.every((id) => typeof id === "string"));
+	const validCompletion = value.completionNotification === undefined || value.completionNotification === "pending" || value.completionNotification === "delivered" || value.completionNotification === "suppressed";
+	const validSummary = value.completionSummary === undefined || (typeof value.completionSummary === "string" && value.completionSummary.length <= COMPLETION_SUMMARY_MAX_CHARS + 3);
+	if (value.version !== POINTER_VERSION || typeof value.runId !== "string" || typeof value.agent !== "string" || typeof value.task !== "string" || !validSource || !validScope || !validMode || !validParent || !validChildren || !validCompletion || !validSummary || !isStatus(value.status) || typeof value.startedAt !== "number") return undefined;
+	return { ...(value as unknown as RunPointer), childRunIds: Array.isArray(value.childRunIds) ? [...value.childRunIds] as string[] : undefined };
 }
 
 /** Latest pointer wins; tombstones win even when their pointer was written earlier. */
@@ -76,11 +97,12 @@ export function restoreRunPointers(entries: readonly EntryLike[], ownerSessionId
 	const runs = Array.from(pointers.values())
 		.filter((pointer) => !tombstones.has(pointer.runId))
 		.map((pointer): SubagentRun => ({
-			id: pointer.runId, ownerSessionId, mode: "single", agent: pointer.agent,
+			id: pointer.runId, ownerSessionId, mode: pointer.mode ?? "single", agent: pointer.agent,
 			agentSource: pointer.agentSource, agentScope: pointer.agentScope, task: pointer.task,
 			status: pointer.status, cwd: pointer.cwd, sessionId: pointer.sessionId, sessionDir: pointer.sessionDir,
 			sessionFile: pointer.sessionFile, leafId: pointer.leafId, continuedFromRunId: pointer.continuedFromRunId,
-			startedAt: pointer.startedAt, endedAt: pointer.endedAt, messages: [], usage: makeEmptyUsage(),
+			parentRunId: pointer.parentRunId, childRunIds: pointer.childRunIds, completionNotification: pointer.completionNotification,
+			startedAt: pointer.startedAt, endedAt: pointer.endedAt, finalOutput: pointer.completionSummary, messages: [], usage: makeEmptyUsage(),
 		}));
 	return { runs, maxRunNumber };
 }
@@ -140,6 +162,19 @@ export class RunPointerPersistence {
 		this.pi.appendEntry(RUN_POINTER_ENTRY_TYPE, pointer);
 		this.runGenerations.set(key, generation);
 		this.fingerprints.set(key, fingerprint);
+	}
+
+	/**
+	 * Claim hydrated metadata for the current generation after a main-session
+	 * action (for example consuming a completion on user input). This must not be
+	 * used by asynchronous child runners from an older generation.
+	 */
+	recordCurrent(run: SubagentRun): void {
+		if (this.activeOwner !== run.ownerSessionId) return;
+		const key = `${run.ownerSessionId}\u0000${run.id}`;
+		this.runGenerations.set(key, this.generation);
+		this.fingerprints.delete(key);
+		this.record(run);
 	}
 
 	/** Persist activation-time closure without granting an old run a new generation. */

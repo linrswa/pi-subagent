@@ -2,9 +2,23 @@
   "name": "pi-subagent",
   "private": true,
   "version": "0.1.0",
+  "description": "Background-first subagents with isolated Pi sessions, continuations, chains, scheduling, and cancellation",
   "type": "module",
+  "license": "MIT",
+  "author": "linrswa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linrswa/pi-subagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/linrswa/pi-subagent/issues"
+  },
+  "homepage": "https://github.com/linrswa/pi-subagent#readme",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi",
+    "subagent",
+    "coding-agent"
   ],
   "scripts": {
     "check": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 index.ts agents.ts",

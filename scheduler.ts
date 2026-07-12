@@ -293,8 +293,8 @@ export class SubagentSchedulerController {
 		if ((job.nextRunAt ?? 0) - Date.now() > 1000) return this.arm(job);
 
 		job.lastRunAt = Date.now();
-		const result = await manager.startBackground(ctx, {
-			prompt: job.prompt,
+		const result = await manager.startAgent(ctx, {
+			task: job.prompt,
 			agent: job.agent,
 			agentScope: job.agentScope,
 			confirmProjectAgents: false,

@@ -30,6 +30,21 @@ test("run pointers retain only metadata and restore refs without id collisions",
 	assert.equal(store.create({ mode: "single", agent: "explorer", agentSource: "user", task: "new" }).id, "subagent-2");
 });
 
+test("malformed chain relationship metadata is rejected", () => {
+	const pointer = { ...toRunPointer(run()), childRunIds: "not-an-array" };
+	assert.deepEqual(restoreRunPointers([{ type: "custom", customType: RUN_POINTER_ENTRY_TYPE, data: pointer }], "main-A").runs, []);
+	const invalidParent = { ...toRunPointer(run()), parentRunId: 42 };
+	assert.deepEqual(restoreRunPointers([{ type: "custom", customType: RUN_POINTER_ENTRY_TYPE, data: invalidParent }], "main-A").runs, []);
+});
+
+test("chain relationship metadata survives pointer restoration", () => {
+	const chain = { ...run("subagent-10"), mode: "chain" as const, agent: "chain", childRunIds: ["subagent-11", "subagent-12"] };
+	const pointer = toRunPointer(chain);
+	const restored = restoreRunPointers([{ type: "custom", customType: RUN_POINTER_ENTRY_TYPE, data: pointer }], "main-A").runs[0];
+	assert.equal(restored?.mode, "chain");
+	assert.deepEqual(restored?.childRunIds, ["subagent-11", "subagent-12"]);
+});
+
 test("tombstones prevent a deleted pointer from reviving and reserve its number", () => {
 	const pointer = toRunPointer(run("subagent-7"));
 	const restored = restoreRunPointers([
@@ -111,6 +126,25 @@ test("custom pointer entries are excluded from buildSessionContext", async () =>
 		assert.deepEqual(context.messages.map((message) => message.content), ["visible"]);
 		assert.equal(JSON.stringify(context).includes("SECRET CHILD TRANSCRIPT"), false);
 	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("current-session acknowledgement can persist hydrated completion state after A to B to A", () => {
+	const entries = new Map<string, Array<{ type: string; customType: string; data: any }>>([["main-A", []], ["main-B", []]]);
+	let active = "main-A";
+	const persistence = new RunPointerPersistence({ appendEntry: (customType: string, data: unknown) => entries.get(active)!.push({ type: "custom", customType, data }) } as any);
+	const store = new SubagentRunStore();
+	persistence.activate("main-A", entries.get("main-A")!, store);
+	const pending = { ...run(), completionNotification: "pending" as const, finalOutput: "done" };
+	persistence.record(pending);
+	active = "main-B";
+	persistence.activate("main-B", entries.get("main-B")!, store);
+	active = "main-A";
+	persistence.activate("main-A", entries.get("main-A")!, store);
+	const hydrated = store.get("subagent-1", "main-A")!;
+	const delivered = store.update(hydrated.id, { completionNotification: "delivered" }, "main-A")!;
+	persistence.recordCurrent(delivered);
+	const restored = restoreRunPointers(entries.get("main-A")!, "main-A").runs[0];
+	assert.equal(restored?.completionNotification, "delivered");
 });
 
 test("session-generation guard never appends an old background run into a new session", () => {

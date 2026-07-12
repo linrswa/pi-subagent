@@ -43,7 +43,7 @@ test("scheduled firing records the background run id", async (t) => {
 	});
 
 	const manager = {
-		startBackground: async (_ctx: unknown, params: unknown) => {
+		startAgent: async (_ctx: unknown, params: unknown) => {
 			started.push(params);
 			return { ok: true as const, run: { id: "subagent-scheduled-run" }, agentScope: "user" as const };
 		},
@@ -63,7 +63,7 @@ test("scheduled firing records the background run id", async (t) => {
 
 	assert.equal(started.length, 1);
 	assert.deepEqual(started[0], {
-		prompt: "run scheduled work",
+		task: "run scheduled work",
 		agent: undefined,
 		agentScope: "user",
 		confirmProjectAgents: false,

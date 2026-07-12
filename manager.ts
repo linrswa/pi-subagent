@@ -2,13 +2,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
-import { cleanupChildSession, createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
-import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
+import { cleanupChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { getFinalOutput, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { OwnerRunLifecycle } from "./run-lifecycle.ts";
 import { subagentRunStore, type SubagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
-import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
+import type { OnUpdateCallback, SingleResult, StartedAgentRun, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
 
 /**
  * Persisted parents use their Pi session id; --no-session parents share a
@@ -29,19 +29,16 @@ function compactPreview(text: string | undefined, maxLength: number): string {
 }
 
 export function getMode(params: SubagentParamsInput): SubagentMode | undefined {
-	// Continuations cannot be embedded in parallel/chain calls, including an
-	// explicitly supplied empty collection.
-	if (params.continueFrom && (params.tasks !== undefined || params.chain !== undefined)) return undefined;
+	// Reject removed batch calls explicitly when resuming an older stored tool call.
+	if ("tasks" in params) return undefined;
+	// Continuations are single-run operations and cannot be embedded in a chain,
+	// including an explicitly supplied empty chain.
+	if (params.continueFrom && params.chain !== undefined) return undefined;
 	const hasChain = (params.chain?.length ?? 0) > 0;
-	const hasTasks = (params.tasks?.length ?? 0) > 0;
-	// A continuation supplies its agent from the source run when none is named.
-	// It is deliberately a single-mode operation: no tasks/chain may accompany it.
-	const hasSingle = Boolean(params.task && (params.agent || params.continueFrom));
-	const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-	if (modeCount !== 1) return undefined;
-	if (hasChain) return "chain";
-	if (hasTasks) return "parallel";
-	return "single";
+	// Fresh single runs default to explorer; continuations inherit their agent.
+	const hasSingle = Boolean(params.task);
+	if (Number(hasChain) + Number(hasSingle) !== 1) return undefined;
+	return hasChain ? "chain" : "single";
 }
 
 export function normalizeAgentRef(agent: string | undefined): string | undefined {
@@ -67,7 +64,7 @@ export function getAgentCompletions(cwd: string, token: string, scope: AgentScop
 		.map((agent) => ({ value: agent.name, label: agent.name, description: `${agent.source}: ${agent.description}` }));
 }
 
-export function getBgAgentCompletions(cwd: string, prefix: string): AutocompleteItem[] | null {
+export function getAgentCommandCompletions(cwd: string, prefix: string): AutocompleteItem[] | null {
 	if (/\s/.test(prefix.trim())) return null;
 	const items = getAgentCompletions(cwd, prefix);
 	return items.length > 0 ? items : null;
@@ -78,7 +75,7 @@ export function getContinuationCallDisplay(
 	sourceRun = params.continueFrom ? findRunByRef(params.continueFrom) : undefined,
 ): { agentName: string; agentScope: AgentScope | "unknown" } {
 	if (!params.continueFrom) {
-		return { agentName: params.agent ?? "...", agentScope: params.agentScope ?? "user" };
+		return { agentName: params.agent ?? "explorer", agentScope: params.agentScope ?? "user" };
 	}
 
 	// Calls render before execution has resolved continuation metadata. Reuse
@@ -147,10 +144,13 @@ export function formatRunDetails(run: SubagentRun): string {
 		`usage: ${usage}`,
 		`final output: ${output ?? "(none)"}`,
 		`error: ${run.errorMessage ?? "(none)"}`,
+		`completion notification: ${run.completionNotification ?? "(legacy/none)"}`,
 		`session id: ${run.sessionId ?? "(none)"}`,
 		`session file: ${run.sessionFile ?? "(none)"}`,
 		`session leaf: ${run.leafId ?? "(none)"}`,
 		`continued from: ${run.continuedFromRunId ? `${formatShortRunId(run.continuedFromRunId)} (${run.continuedFromRunId})${run.continuedFromLeafId ? ` leaf ${run.continuedFromLeafId}` : ""}` : "(none)"}`,
+		`parent run: ${run.parentRunId ? `${formatShortRunId(run.parentRunId)} (${run.parentRunId})` : "(none)"}`,
+		`child runs: ${run.childRunIds?.length ? run.childRunIds.map((id) => `${formatShortRunId(id)} (${id})`).join(", ") : "(none)"}`,
 	].join("\n");
 }
 
@@ -189,16 +189,32 @@ export async function confirmProjectAgentIfNeeded(
 	return Boolean(ok);
 }
 
-export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: BgAgentParamsInput, lifecycle?: OwnerRunLifecycle): Promise<StartBackgroundAgentResult> {
-	// Capture before confirmation/session allocation; this promise may outlive a session switch.
-	const ownerSessionId = getMainSessionOwnerId(ctx);
-	const signal = lifecycle?.signalFor(ownerSessionId);
-	const task = params.prompt?.trim();
-	if (!task) return { ok: false, message: "bg_agent requires prompt." };
+export interface StartAgentParams {
+	task?: string;
+	agent?: string;
+	agentScope?: AgentScope;
+	confirmProjectAgents?: boolean;
+	cwd?: string;
+	sourceRun?: SubagentRun;
+	signal?: AbortSignal;
+	onUpdate?: OnUpdateCallback;
+	parentRunId?: string;
+	step?: number;
+}
 
-	const agentScope: AgentScope = params.agentScope ?? "user";
+/** Start one managed child run and return its handle without awaiting completion. */
+export async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: StartAgentParams, lifecycle?: OwnerRunLifecycle): Promise<StartedAgentRun> {
+	const ownerSessionId = getMainSessionOwnerId(ctx);
+	// Capture the runtime signal before any interactive confirmation can await.
+	// A shutdown during confirmation must not recreate a fresh owner controller.
+	const runSignal = lifecycle?.signalFor(ownerSessionId, params.signal) ?? params.signal;
+	const task = params.task?.trim();
+	if (!task) return { ok: false, message: "subagent requires a task." };
+
+	const sourceRun = params.sourceRun;
+	const agentScope: AgentScope = params.agentScope ?? sourceRun?.agentScope ?? (sourceRun?.agentSource === "project" ? "both" : "user");
 	const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
-	const agentName = chooseBackgroundAgent(discovery.agents, params.agent);
+	const agentName = sourceRun ? (params.agent ?? sourceRun.agent) : chooseBackgroundAgent(discovery.agents, params.agent);
 	if (!agentName) return { ok: false, message: "No subagents available." };
 
 	const agent = discovery.agents.find((candidate) => candidate.name === agentName);
@@ -209,15 +225,11 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 
 	const ok = await confirmProjectAgentIfNeeded(ctx, discovery, agent, params.confirmProjectAgents ?? true);
 	if (!ok) return { ok: false, message: "Canceled: project-local agent not approved." };
-	if (signal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
+	if (runSignal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
 
 	const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	let fallbackThinkingLevel: string | undefined;
-	try {
-		fallbackThinkingLevel = pi.getThinkingLevel();
-	} catch {
-		fallbackThinkingLevel = undefined;
-	}
+	try { fallbackThinkingLevel = pi.getThinkingLevel(); } catch { fallbackThinkingLevel = undefined; }
 
 	const makeDetails = (results: SingleResult[]): SubagentDetails => ({
 		mode: "single",
@@ -227,32 +239,23 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		projectAgentsDir: discovery.projectAgentsDir,
 		results: results.map(toParentResult),
 	});
-	// Allocate the managed child session before calling runSingleAgent. Once its
-	// session arguments are supplied, runSingleAgent creates the run synchronously
-	// (before its next await), which is required by the background API.
-	let freshSession: Awaited<ReturnType<typeof createFreshChildSession>>;
-	try {
-		freshSession = await createFreshChildSession(ownerSessionId);
-	} catch (error) {
-		return { ok: false, message: `Failed to allocate child session: ${error instanceof Error ? error.message : String(error)}` };
-	}
-
-	if (signal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
 	let createdRun: SubagentRun | undefined;
-	const promise = runSingleAgent({
-		mode: "single",
+	const completion = runSingleAgent({
+		mode: params.parentRunId ? "chain" : "single",
 		defaultCwd: ctx.cwd,
 		agents: discovery.agents,
 		agentName,
 		fallbackModel,
 		fallbackThinkingLevel,
 		task,
-		cwd: params.cwd,
+		cwd: sourceRun?.cwd ?? params.cwd,
+		step: params.step,
+		parentRunId: params.parentRunId,
 		agentScope,
 		ownerSessionId,
-		signal,
-		sessionId: freshSession.sessionId,
-		sessionDir: freshSession.sessionDir,
+		continueFrom: sourceRun ? { runId: sourceRun.id, sessionFile: sourceRun.sessionFile!, leafId: sourceRun.leafId! } : undefined,
+		signal: runSignal,
+		onUpdate: params.onUpdate,
 		makeDetails,
 		onRunCreated: (run) => {
 			createdRun = run;
@@ -260,20 +263,8 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		},
 	});
 
-	void promise
-		.then((result) => {
-			if (isFailedResult(result) && result.stopReason !== "aborted") {
-				const runLabel = result.runId ? formatShortRunId(result.runId) : agentName;
-				ctx.ui.notify(`Background ${runLabel} failed: ${compactPreview(getResultOutput(result), 160)}`, "error");
-			}
-		})
-		.catch((error) => {
-			const message = error instanceof Error ? error.message : String(error);
-			if (message !== "Subagent was aborted") ctx.ui.notify(`Background ${agentName} failed: ${message}`, "error");
-		});
-
-	if (!createdRun) return { ok: false, message: "Failed to start background subagent." };
-	return { ok: true, run: createdRun, agentScope };
+	if (!createdRun) return { ok: false, message: "Failed to start subagent." };
+	return { ok: true, run: createdRun, completion, agentScope };
 }
 
 export interface DeleteRunResult {
@@ -286,12 +277,20 @@ export class SubagentManager {
 	private readonly onRunDeleted?: (run: SubagentRun) => void;
 	private readonly lifecycle?: OwnerRunLifecycle;
 	private readonly store: SubagentRunStore;
+	private readonly onBackgroundRun?: (run: SubagentRun, completion: Promise<SingleResult>) => void;
 
-	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void, lifecycle?: OwnerRunLifecycle, store: SubagentRunStore = subagentRunStore) {
+	constructor(
+		pi: ExtensionAPI,
+		onRunDeleted?: (run: SubagentRun) => void,
+		lifecycle?: OwnerRunLifecycle,
+		store: SubagentRunStore = subagentRunStore,
+		onBackgroundRun?: (run: SubagentRun, completion: Promise<SingleResult>) => void,
+	) {
 		this.pi = pi;
 		this.onRunDeleted = onRunDeleted;
 		this.lifecycle = lifecycle;
 		this.store = store;
+		this.onBackgroundRun = onBackgroundRun;
 	}
 
 	listRuns(): SubagentRun[] {
@@ -372,8 +371,13 @@ export class SubagentManager {
 		return { ok: false, message: "Timed out waiting for the running subagent to stop; its session was not deleted." };
 	}
 
-	startBackground(ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {
-		return startBackgroundAgent(this.pi, ctx, params, this.lifecycle);
+	async startAgent(ctx: ExtensionContext, params: StartAgentParams, notify = true): Promise<StartedAgentRun> {
+		const result = await startAgent(this.pi, ctx, params, this.lifecycle);
+		if (!result.ok) return result;
+		const completionNotification = notify ? "pending" as const : "suppressed" as const;
+		const run = this.store.update(result.run.id, { completionNotification }, result.run.ownerSessionId) ?? { ...result.run, completionNotification };
+		if (notify) this.onBackgroundRun?.(run, result.completion);
+		return { ...result, run };
 	}
 }
 

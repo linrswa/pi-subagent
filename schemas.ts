@@ -1,13 +1,3 @@
-const TaskItemSchema = {
-	type: "object",
-	required: ["agent", "task"],
-	properties: {
-		agent: { type: "string", description: "Name of the agent to invoke" },
-		task: { type: "string", description: "Task to delegate to the agent" },
-		cwd: { type: "string", description: "Working directory for the agent process" },
-	},
-} as const;
-
 const ChainItemSchema = {
 	type: "object",
 	required: ["agent", "task"],
@@ -24,15 +14,15 @@ export const SubagentParamsSchema = {
 		agent: { type: "string", description: "Name of the agent to invoke (for single mode or continuation override)" },
 		continueFrom: { type: "string", description: "Completed run to continue: subagent-3, &3, or 3. Requires task and supports single mode only." },
 		task: { type: "string", description: "Task to delegate (required for single mode and continuation)" },
-		tasks: {
-			type: "array",
-			description: "Array of {agent, task} for parallel execution",
-			items: TaskItemSchema,
-		},
 		chain: {
 			type: "array",
 			description: "Array of {agent, task} for sequential execution",
 			items: ChainItemSchema,
+		},
+		wait: {
+			type: "boolean",
+			default: false,
+			description: "Wait for completion and return final output. Defaults to false (background).",
 		},
 		agentScope: {
 			type: "string",
@@ -60,27 +50,6 @@ export const SubagentControlParamsSchema = {
 			description: "Control action. list summarizes runs; status inspects one run; stop aborts; delete removes.",
 		},
 		runId: { type: "string", description: "Run id required for status, stop, and delete; e.g. subagent-3, &3, or 3." },
-	},
-} as const;
-
-export const BgAgentParamsSchema = {
-	type: "object",
-	required: ["prompt"],
-	properties: {
-		prompt: { type: "string", description: "Prompt/task for the background agent." },
-		agent: { type: "string", description: "Agent name. Defaults to explorer when available, otherwise the first available agent." },
-		agentScope: {
-			type: "string",
-			enum: ["user", "project", "both"],
-			default: "user",
-			description: "Agent discovery scope. Default: user.",
-		},
-		confirmProjectAgents: {
-			type: "boolean",
-			default: true,
-			description: "Prompt before running project-local agents. Default: true.",
-		},
-		cwd: { type: "string", description: "Working directory for the background agent process." },
 	},
 } as const;
 

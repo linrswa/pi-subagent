@@ -5,29 +5,10 @@ import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "./agents.ts";
 import { branchChildSession, cleanupChildSession, createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { childProcessPool, type ReleaseProcessSlot } from "./process-pool.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import type { AgentMessage, ContinuationSource, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
-
-export async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
 
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
@@ -67,6 +48,9 @@ export interface RunSingleAgentOptions {
 	task: string;
 	cwd?: string;
 	step?: number;
+	/** Synthetic chain run which owns this child step. */
+	parentRunId?: string;
+	completionNotification?: SubagentRun["completionNotification"];
 	/** Child-session pointer metadata only; never child-session history. */
 	agentScope?: AgentScope;
 	/** Main-session id, or a process-local runtime owner for ephemeral parents. */
@@ -97,6 +81,8 @@ export async function runSingleAgent({
 	task,
 	cwd,
 	step,
+	parentRunId,
+	completionNotification,
 	agentScope,
 	ownerSessionId,
 	sessionId: suppliedSessionId,
@@ -121,11 +107,13 @@ export async function runSingleAgent({
 	let wasAborted = false;
 	let queuedSetupPending = false;
 	let queuedTerminal = false;
+	let releaseProcessSlot: ReleaseProcessSlot | undefined;
+	const queuedAbortController = new AbortController();
 	// Create synchronously, before child-session setup. A shutdown can therefore
 	// abort a queued run instead of racing an untracked async setup operation.
 	const run = subagentRunStore.create({
 		mode, ownerSessionId: runOwnerSessionId, agent: agentName,
-		agentSource: agent?.source ?? "unknown", task, step, cwd: runCwd,
+		agentSource: agent?.source ?? "unknown", task, step, parentRunId, completionNotification, cwd: runCwd,
 		model: selectedModel, agentScope, sessionId: suppliedSessionId,
 		sessionDir: suppliedSessionDir, sessionFile: suppliedSessionFile, leafId: suppliedLeafId,
 		continuedFromRunId, continuedFromLeafId,
@@ -141,8 +129,9 @@ export async function runSingleAgent({
 	const abortQueued = () => {
 		if (wasAborted) return;
 		wasAborted = true;
-		// Session branching/setup may still be awaiting. It can create a file, so
-		// its continuation owns cleanup and publication of this terminal state.
+		queuedAbortController.abort();
+		// Session branching/setup or process-pool waiting may still be awaiting.
+		// That continuation owns cleanup and publication of this terminal state.
 		if (!queuedSetupPending) terminalizeQueued("aborted", "Subagent was aborted");
 	};
 	subagentRunStore.update(run.id, { abort: abortQueued }, runOwnerSessionId);
@@ -212,6 +201,10 @@ export async function runSingleAgent({
 	};
 	queuedSetupPending = true;
 	try {
+		// Reserve the process slot before asynchronous session setup so FIFO order
+		// follows run submission order rather than setup completion speed.
+		releaseProcessSlot = await childProcessPool.acquire(queuedAbortController.signal);
+		if (wasAborted) throw new Error("Subagent was aborted");
 		branchedSession = continueFrom ? await branchChildSession(continueFrom) : undefined;
 		freshSession = !branchedSession && !(suppliedSessionId && suppliedSessionDir)
 			? await createFreshChildSession(runOwnerSessionId)
@@ -219,6 +212,8 @@ export async function runSingleAgent({
 	} catch (error) {
 		queuedSetupPending = false;
 		removeQueuedAbortListener();
+		releaseProcessSlot?.();
+		releaseProcessSlot = undefined;
 		await cleanupBranchedSession();
 		terminalizeQueued(wasAborted ? "aborted" : "failed", wasAborted ? "Subagent was aborted" : error instanceof Error ? error.message : String(error));
 		throw error;
@@ -231,6 +226,8 @@ export async function runSingleAgent({
 	if (wasAborted) {
 		queuedSetupPending = false;
 		removeQueuedAbortListener();
+		releaseProcessSlot?.();
+		releaseProcessSlot = undefined;
 		await cleanupBranchedSession();
 		terminalizeQueued("aborted", "Subagent was aborted");
 		throw new Error("Subagent was aborted");
@@ -242,7 +239,7 @@ export async function runSingleAgent({
 	} else {
 		args.push("--session-id", sessionId, "--session-dir", sessionDir);
 	}
-	args.push("--exclude-tools", "subagent,bg_agent,subagent_schedule");
+	args.push("--exclude-tools", "subagent,subagent_schedule");
 	if (selectedModel) args.push("--model", selectedModel);
 	if (!agent.model && fallbackThinkingLevel) args.push("--thinking", fallbackThinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -323,7 +320,9 @@ export async function runSingleAgent({
 		// must be only the newly requested task, never reconstructed history.
 		args.push(branchedSession ? task : `Task: ${task}`);
 
-		const exitCode = await new Promise<number>((resolve) => {
+		let exitCode: number;
+		try {
+			exitCode = await new Promise<number>((resolve) => {
 			// From here spawn is synchronous and installs its own abort listener.
 			queuedSetupPending = false;
 			removeQueuedAbortListener();
@@ -447,7 +446,11 @@ export async function runSingleAgent({
 				syncRun({ errorMessage: currentResult.errorMessage, currentTool: undefined, abort: undefined });
 				resolve(1);
 			});
-		});
+			});
+		} finally {
+			releaseProcessSlot?.();
+			releaseProcessSlot = undefined;
+		}
 
 		currentResult.exitCode = exitCode;
 
@@ -485,6 +488,7 @@ export async function runSingleAgent({
 		markTerminal(aborted ? "aborted" : "failed");
 		throw error;
 	} finally {
+		releaseProcessSlot?.();
 		if (tmpPromptDir) await fs.promises.rm(tmpPromptDir, { recursive: true, force: true }).catch(() => {});
 	}
 }

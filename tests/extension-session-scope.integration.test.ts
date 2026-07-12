@@ -96,4 +96,19 @@ test("extension public run visibility follows the active persisted Pi session", 
 	assert.match(restored, /A-only work/);
 	assert.doesNotMatch(restored, /B-only work|B-private continuation source/);
 	assert.match(await text(control.execute("status", { action: "status", runId: "&1" }, undefined, undefined, contextFor(sessionA))), /A-only work/);
+
+	const pending = subagentRunStore.create({
+		mode: "single", agent: "explorer", agentSource: "user", task: "pending completion",
+		status: "completed", endedAt: Date.now(), finalOutput: "durable result",
+		completionNotification: "pending", cwd: process.cwd(),
+	});
+	assert.equal(handlers.get("input")!({ source: "user", text: "steer", streamingBehavior: "steer" }).action, "continue");
+	assert.equal(handlers.get("input")!({ source: "user", text: "/implement something" }).action, "continue");
+	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "pending");
+	const ordinary = handlers.get("input")!({ source: "user", text: "what finished?" });
+	assert.match(ordinary.text, /Background subagent completion update/);
+	assert.match(ordinary.text, /durable result/);
+	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "pending", "input staging is not acknowledgement");
+	handlers.get("agent_start")!({}, contextFor(sessionA));
+	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "delivered");
 });

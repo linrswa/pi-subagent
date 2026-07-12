@@ -39,7 +39,7 @@ test("pi loads this package and registers the public tools, commands, and schema
 	pi.registerCommand("probe-subagent-integration", {
 		description: "Probe subagent extension registration",
 		handler: async (_args, ctx) => {
-			const expectedTools = ["subagent_control", "bg_agent", "subagent_schedule", "subagent"];
+			const expectedTools = ["subagent_control", "subagent_schedule", "subagent"];
 			const expectedCommands = ["subagent-view", "subagent-schedules", "subagent-setting", "bg", "subagents"];
 			const expectedPrompts = ["explorer-and-plan", "implement-and-review", "implement"];
 			const tools = pi.getAllTools().map((tool) => tool.name).sort();
@@ -51,10 +51,13 @@ test("pi loads this package and registers the public tools, commands, and schema
 				missingCommands: expectedCommands.filter((name) => !commands.includes(name)),
 				missingPrompts: expectedPrompts.filter((name) => !commands.includes(name)),
 				continueFrom: subagentSchema.includes("continueFrom"),
+				wait: subagentSchema.includes("wait"),
+				removedBgTool: !tools.includes("bg_agent"),
+				removedTasks: !subagentSchema.includes('"tasks"'),
 				controlHasAsk: controlSchema.includes("ask"),
 				legacyModePresent: [subagentSchema, controlSchema, ...pi.getAllTools().map((tool) => JSON.stringify(tool.parameters ?? {}))].some((schema) => schema.toLowerCase().includes("pony" + "tailmode")),
 			};
-			const valid = payload.missingTools.length === 0 && payload.missingCommands.length === 0 && payload.missingPrompts.length === 0 && payload.continueFrom && !payload.controlHasAsk && !payload.legacyModePresent;
+			const valid = payload.missingTools.length === 0 && payload.missingCommands.length === 0 && payload.missingPrompts.length === 0 && payload.continueFrom && payload.wait && payload.removedBgTool && payload.removedTasks && !payload.controlHasAsk && !payload.legacyModePresent;
 			ctx.ui.notify(JSON.stringify(payload), valid ? "info" : "error");
 			ctx.shutdown();
 		},
@@ -76,7 +79,7 @@ test("pi loads this package and registers the public tools, commands, and schema
 		const notify = events.find((event) => event.type === "extension_ui_request" && event.method === "notify" && event.message?.includes("missingTools"));
 		assert.ok(notify, result.stdout);
 		assert.deepEqual(JSON.parse(notify.message), {
-			missingTools: [], missingCommands: [], missingPrompts: [], continueFrom: true, controlHasAsk: false, legacyModePresent: false,
+			missingTools: [], missingCommands: [], missingPrompts: [], continueFrom: true, wait: true, removedBgTool: true, removedTasks: true, controlHasAsk: false, legacyModePresent: false,
 		});
 		assert.equal(events.find((event) => event.id === "probe")?.success, true, result.stdout);
 	} finally {

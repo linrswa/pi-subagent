@@ -50,7 +50,14 @@ export class SubagentRunStore {
 		const key = this.key(ownerSessionId, id);
 		const existing = this.runs.get(key);
 		if (!existing) return undefined;
-		const next: SubagentRun = { ...existing, ...patch, ownerSessionId: existing.ownerSessionId, messages: patch.messages ? [...patch.messages] : existing.messages, usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage };
+		const next: SubagentRun = {
+			...existing,
+			...patch,
+			ownerSessionId: existing.ownerSessionId,
+			messages: patch.messages ? [...patch.messages] : existing.messages,
+			usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage,
+			childRunIds: patch.childRunIds ? [...patch.childRunIds] : existing.childRunIds,
+		};
 		this.runs.set(key, next);
 		this.notifyChange(next);
 		this.notify();
@@ -110,7 +117,9 @@ export class SubagentRunStore {
 		}
 	}
 	private key(ownerSessionId: string, id: string): string { return `${ownerSessionId}\u0000${id}`; }
-	private cloneRun(run: SubagentRun): SubagentRun { return { ...run, messages: [...run.messages], usage: cloneUsageStats(run.usage) }; }
+	private cloneRun(run: SubagentRun): SubagentRun {
+		return { ...run, messages: [...run.messages], usage: cloneUsageStats(run.usage), childRunIds: run.childRunIds ? [...run.childRunIds] : undefined };
+	}
 	private notify(): void {
 		for (const [subscriber, ownerSessionId] of this.subscribers) {
 			try { subscriber(this.getSnapshot(ownerSessionId)); } catch { /* isolate subscribers */ }

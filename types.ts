@@ -1,7 +1,8 @@
 import type { AgentScope, AgentSource } from "./agents.ts";
 
-export type SubagentMode = "single" | "parallel" | "chain";
+export type SubagentMode = "single" | "chain";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "aborted";
+export type CompletionNotificationState = "pending" | "delivered" | "suppressed";
 
 export interface UsageStats {
 	input: number;
@@ -62,6 +63,11 @@ export interface SubagentRun {
 	leafId?: string;
 	continuedFromRunId?: string;
 	continuedFromLeafId?: string;
+	/** Synthetic chain parent for child steps, or child runs for a chain parent. */
+	parentRunId?: string;
+	childRunIds?: string[];
+	/** Durable background completion-delivery state; absent on legacy runs. */
+	completionNotification?: CompletionNotificationState;
 	abort?: () => void;
 }
 
@@ -103,7 +109,7 @@ export interface SingleResult {
 export interface ParentResult {
 	runId?: string;
 	agent: string;
-	status: Exclude<RunStatus, "queued">;
+	status: RunStatus;
 	finalOutput: string;
 	usage: UsageStats;
 	model?: string;
@@ -117,6 +123,8 @@ export interface SubagentDetails {
 	packageAgentsDir: string;
 	userAgentsDir: string;
 	projectAgentsDir: string | null;
+	/** Present when results contains a synthetic background chain parent. */
+	chainStepCount?: number;
 	results: ParentResult[];
 }
 
@@ -138,8 +146,9 @@ export type SubagentParamsInput = {
 	/** Completed source run reference: subagent-3, &3, or 3. */
 	continueFrom?: string;
 	task?: string;
-	tasks?: TaskItem[];
 	chain?: TaskItem[];
+	/** Wait for completion and return the final output. Defaults to false. */
+	wait?: boolean;
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
 	cwd?: string;
@@ -150,14 +159,6 @@ export type SubagentControlAction = "list" | "status" | "stop" | "delete";
 export type SubagentControlParamsInput = {
 	action?: SubagentControlAction;
 	runId?: string;
-};
-
-export type BgAgentParamsInput = {
-	prompt?: string;
-	agent?: string;
-	agentScope?: AgentScope;
-	confirmProjectAgents?: boolean;
-	cwd?: string;
 };
 
 export type SubagentScheduleAction = "add" | "list" | "delete";
@@ -189,12 +190,12 @@ export interface SubagentScheduleJob {
 	lastRunId?: string;
 }
 
-export type StartBackgroundAgentResult = { ok: true; run: SubagentRun; agentScope: AgentScope } | { ok: false; message: string };
+export type StartedAgentRun = { ok: true; run: SubagentRun; completion: Promise<SingleResult>; agentScope: AgentScope } | { ok: false; message: string };
 
 export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };
 
 export type SubagentRunSubscriber = (runs: readonly SubagentRun[]) => void;
 export type CreateSubagentRunInput = Pick<SubagentRun, "mode" | "agent" | "agentSource" | "task"> &
 	/** Omitted only for legacy/runtime callers; store assigns its active runtime owner. */
-	Partial<Pick<SubagentRun, "ownerSessionId" | "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId">>;
+	Partial<Pick<SubagentRun, "ownerSessionId" | "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId" | "parentRunId" | "childRunIds" | "completionNotification">>;
 export type SubagentRunPatch = Partial<Omit<SubagentRun, "id">>;
