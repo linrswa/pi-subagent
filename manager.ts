@@ -73,7 +73,7 @@ export function getBgAgentCompletions(cwd: string, prefix: string): Autocomplete
 }
 
 export function getRunRefCompletions(token: string): AutocompleteItem[] {
-	const query = token.trim().toLowerCase();
+	const query = token.trim().replace(/^[&＆]/, "").toLowerCase();
 	return subagentRunStore
 		.getSnapshot()
 		.filter((run) => {
@@ -85,7 +85,7 @@ export function getRunRefCompletions(token: string): AutocompleteItem[] {
 		.map((run) => ({
 			value: `&${formatShortRunId(run.id).slice(1)}`,
 			label: `&${formatShortRunId(run.id).slice(1)}`,
-			description: `${run.status} ${run.agent}: ${compactPreview(run.task, 80)}`,
+			description: `${run.status} ${run.agent}: ${compactPreview(run.task, 48)}`,
 		}));
 }
 
@@ -141,7 +141,10 @@ export function buildRunRefContext(text: string): string | undefined {
 	const lines = refs
 		.map((ref) => findRunByRef(ref))
 		.filter((run): run is SubagentRun => Boolean(run))
-		.map((run) => `- &${formatShortRunId(run.id).slice(1)} = ${run.id} (${run.status} ${run.agent}); use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete, or subagent with continueFrom: "${formatShortRunId(run.id)}" for a follow-up.`);
+		.map((run) => [
+			`- ${formatShortRunId(run.id)} = ${run.id} (${run.status} ${run.agent}); use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete.`,
+			`For follow-up work, call subagent with { continueFrom: "${formatShortRunId(run.id)}", task: "..." }.`,
+		].join(" "));
 	return lines.length > 0 ? `Subagent run refs:\n${lines.join("\n")}` : undefined;
 }
 

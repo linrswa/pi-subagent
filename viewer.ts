@@ -67,6 +67,10 @@ function compactPreview(text: string | undefined, maxLength: number): string {
 	return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
 }
 
+function formatParentRun(run: SubagentRun): string | undefined {
+	return run.continuedFromRunId ? `continued from ${formatShortRunId(run.continuedFromRunId)} (${run.continuedFromRunId})` : undefined;
+}
+
 function formatRunList(runs: readonly SubagentRun[]): string {
 	if (runs.length === 0) return "No subagents.";
 	return runs
@@ -74,7 +78,8 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 			const output = run.finalOutput || getFinalOutput(run.messages) || run.errorMessage || "";
 			const tool = run.currentTool ? `\n  current: ${run.currentTool}` : "";
 			const preview = output ? `\n  output: ${compactPreview(output, 180)}` : "";
-			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${tool}${preview}`;
+			const parent = formatParentRun(run);
+			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent ? `\n  ${parent}` : ""}${tool}${preview}`;
 		})
 		.join("\n\n");
 }
@@ -154,6 +159,9 @@ class SubagentRunViewerComponent implements Component {
 			const usage = formatUsageStats(run.usage, run.model);
 			lines.push(this.row(`${runStatusIcon(run.status, this.theme)} ${this.theme.fg("muted", `${formatShortRunId(run.id)} ${run.id}`)} ${this.theme.fg("accent", run.agent)} ${this.theme.fg("dim", run.status)} ${this.theme.fg("dim", formatRunTime(run))}`, innerW));
 			lines.push(this.row(`${this.theme.fg("muted", "task: ")}${this.theme.fg("dim", taskPreview(run.task))}`, innerW));
+			lines.push(this.row(`${this.theme.fg("muted", "session id: ")}${this.theme.fg("dim", run.sessionId ?? "(none)")}`, innerW));
+			const parent = formatParentRun(run);
+			if (parent) lines.push(this.row(`${this.theme.fg("muted", "parent run: ")}${this.theme.fg("dim", parent)}`, innerW));
 			if (run.currentTool) lines.push(this.row(`${this.theme.fg("muted", "tool: ")}${this.theme.fg("toolOutput", run.currentTool)}`, innerW));
 			if (usage) lines.push(this.row(`${this.theme.fg("muted", "usage: ")}${this.theme.fg("dim", usage)}`, innerW));
 		}

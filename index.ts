@@ -216,6 +216,10 @@ function compactPreview(text: string | undefined, maxLength: number): string {
 	return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
 }
 
+function formatContinuedFrom(runId: string | undefined): string {
+	return runId ? `continued from ${formatShortRunId(runId)}` : "";
+}
+
 function resultStatusLabel(result: SingleResult): "running" | "completed" | "failed" | "aborted" {
 	if (result.exitCode === -1) return "running";
 	if (result.stopReason === "aborted") return "aborted";
@@ -233,7 +237,8 @@ function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["
 
 	if (details.mode === "single") {
 		const entry = details.results[0];
-		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}: ${theme.fg("dim", compactPreview(entry.task, 72))}${scope}`;
+		const continuation = formatContinuedFrom(entry.continuedFromRunId);
+		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}: ${theme.fg("dim", compactPreview(entry.task, 72))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scope}`;
 	} else if (details.mode === "parallel") {
 		const done = succeeded + failed;
 		const summary = running > 0 ? `${running} running, ${done} done` : `${succeeded}/${details.results.length} succeeded${failed ? `, ${failed} failed` : ""}`;
@@ -273,7 +278,8 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 			const output = run.finalOutput || getFinalOutput(run.messages) || run.errorMessage || "";
 			const tool = run.currentTool ? `\n  current: ${run.currentTool}` : "";
 			const preview = output ? `\n  output: ${compactPreview(output, 180)}` : "";
-			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${tool}${preview}`;
+			const parent = run.continuedFromRunId ? `\n  ${formatContinuedFrom(run.continuedFromRunId)}` : "";
+			return `${formatShortRunId(run.id)} ${run.status} ${run.agent} (${formatRunTime(run)})\n  task: ${compactPreview(run.task, 180)}${parent}${tool}${preview}`;
 		})
 		.join("\n\n");
 }
@@ -792,8 +798,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const agentName = args.agent || "...";
+				const continuation = formatContinuedFrom(args.continueFrom);
 				return new Text(
-					`${theme.fg("warning", "⏳")} ${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.task, 72))}${scopeSuffix}`,
+					`${theme.fg("warning", "⏳")} ${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.task, 72))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scopeSuffix}`,
 					0,
 					0,
 				);
@@ -829,10 +836,12 @@ export default function (pi: ExtensionAPI) {
 
 			const agentName = args.agent || "...";
 			const preview = args.task ? (args.task.length > 72 ? `${args.task.slice(0, 72)}...` : args.task) : "...";
+			const continuation = formatContinuedFrom(args.continueFrom);
 			return new Text(
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", agentName) +
 					theme.fg("muted", ` [${scope}]`) +
+					(continuation ? `\n  ${theme.fg("muted", continuation)}` : "") +
 					`\n  ${theme.fg("dim", preview)}`,
 				0,
 				0,
@@ -859,9 +868,10 @@ export default function (pi: ExtensionAPI) {
 			const failed = details.results.filter((entry) => entry.exitCode !== -1 && isFailedResult(entry)).length;
 			const succeeded = details.results.filter((entry) => entry.exitCode !== -1 && !isFailedResult(entry)).length;
 			const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+			const continuation = details.mode === "single" ? formatContinuedFrom(details.results[0]?.continuedFromRunId) : "";
 			const topStatus =
 				details.mode === "single"
-					? `${modeLabel ?? "subagent"}`
+					? `${modeLabel ?? "subagent"}${continuation ? ` (${continuation})` : ""}`
 					: running > 0
 						? `${succeeded + failed}/${details.results.length} done, ${running} running`
 						: `${succeeded}/${details.results.length} succeeded`;
@@ -878,11 +888,12 @@ export default function (pi: ExtensionAPI) {
 				const icon = resultIcon(entry, theme);
 				const source = entry.agentSource !== "unknown" ? theme.fg("muted", ` (${entry.agentSource})`) : "";
 				const label = entry.step ? `Step ${entry.step}: ${entry.agent}` : entry.agent;
+				const continuedFrom = formatContinuedFrom(entry.continuedFromRunId);
 				const displayItems = getDisplayItems(entry.messages);
 				const finalOutput = getFinalOutput(entry.messages);
 
 				container.addChild(new Spacer(1));
-				container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)}${source} ${icon}`, 0, 0));
+				container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)}${source} ${icon}${continuedFrom ? theme.fg("muted", ` (${continuedFrom})`) : ""}`, 0, 0));
 				if (expanded) {
 					container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", entry.task), 0, 0));
 				}
