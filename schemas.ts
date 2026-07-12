@@ -55,20 +55,11 @@ export const SubagentControlParamsSchema = {
 	properties: {
 		action: {
 			type: "string",
-			enum: ["list", "status", "ask", "stop", "delete"],
+			enum: ["list", "status", "stop", "delete"],
 			default: "list",
-			description: "Control action. list/status inspect runs; ask starts a follow-up subagent; stop aborts; delete removes.",
+			description: "Control action. list summarizes runs; status inspects one run; stop aborts; delete removes.",
 		},
-		runId: { type: "string", description: "Run id to target, e.g. subagent-3, &3, or 3." },
-		question: { type: "string", description: "Question/instruction for action=ask." },
-		context: { type: "string", description: "Optional main-agent context to send with action=ask." },
-		agent: { type: "string", description: "Optional follow-up agent for action=ask. Defaults to the original run's agent." },
-		agentScope: {
-			type: "string",
-			enum: ["user", "project", "both"],
-			description: "Agent discovery scope for action=ask. Defaults to user, or both for project-origin runs.",
-		},
-		cwd: { type: "string", description: "Optional cwd for action=ask. Defaults to the original run cwd." },
+		runId: { type: "string", description: "Run id required for status, stop, and delete; e.g. subagent-3, &3, or 3." },
 	},
 } as const;
 

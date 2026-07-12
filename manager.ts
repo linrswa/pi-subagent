@@ -3,7 +3,7 @@ import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } 
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
 import { createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
-import { getResultOutput, isFailedResult } from "./results.ts";
+import { getFinalOutput, getResultOutput, isFailedResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
@@ -109,12 +109,39 @@ export function createRunRefAutocompleteProvider(current: AutocompleteProvider):
 	};
 }
 
+export function formatRunDetails(run: SubagentRun): string {
+	const output = run.finalOutput || getFinalOutput(run.messages);
+	const usage = [
+		run.usage.turns ? `${run.usage.turns} turn${run.usage.turns === 1 ? "" : "s"}` : "",
+		run.usage.input ? `input ${run.usage.input}` : "",
+		run.usage.output ? `output ${run.usage.output}` : "",
+		run.usage.cost ? `cost $${run.usage.cost.toFixed(4)}` : "",
+	].filter(Boolean).join(", ") || "(none)";
+	return [
+		`${formatShortRunId(run.id)} (${run.id})`,
+		`status: ${run.status}`,
+		`agent: ${run.agent}`,
+		`source: ${run.agentSource}`,
+		`task: ${run.task || "(none)"}`,
+		`cwd: ${run.cwd ?? "(none)"}`,
+		`current tool: ${run.currentTool ?? "(none)"}`,
+		`model: ${run.model ?? "(none)"}`,
+		`usage: ${usage}`,
+		`final output: ${output ?? "(none)"}`,
+		`error: ${run.errorMessage ?? "(none)"}`,
+		`session id: ${run.sessionId ?? "(none)"}`,
+		`session file: ${run.sessionFile ?? "(none)"}`,
+		`session leaf: ${run.leafId ?? "(none)"}`,
+		`continued from: ${run.continuedFromRunId ? `${formatShortRunId(run.continuedFromRunId)} (${run.continuedFromRunId})${run.continuedFromLeafId ? ` leaf ${run.continuedFromLeafId}` : ""}` : "(none)"}`,
+	].join("\n");
+}
+
 export function buildRunRefContext(text: string): string | undefined {
 	const refs = Array.from(new Set(Array.from(text.matchAll(/[&＆](\d+)/g), (match) => match[1])));
 	const lines = refs
 		.map((ref) => findRunByRef(ref))
 		.filter((run): run is SubagentRun => Boolean(run))
-		.map((run) => `- &${formatShortRunId(run.id).slice(1)} = ${run.id} (${run.status} ${run.agent}); use subagent_control runId ${formatShortRunId(run.id)} for status/ask/stop/delete.`);
+		.map((run) => `- &${formatShortRunId(run.id).slice(1)} = ${run.id} (${run.status} ${run.agent}); use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete, or subagent with continueFrom: "${formatShortRunId(run.id)}" for a follow-up.`);
 	return lines.length > 0 ? `Subagent run refs:\n${lines.join("\n")}` : undefined;
 }
 

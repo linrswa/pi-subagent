@@ -127,16 +127,11 @@ export type SubagentParamsInput = {
 	cwd?: string;
 };
 
-export type SubagentControlAction = "list" | "status" | "ask" | "stop" | "delete";
+export type SubagentControlAction = "list" | "status" | "stop" | "delete";
 
 export type SubagentControlParamsInput = {
 	action?: SubagentControlAction;
 	runId?: string;
-	question?: string;
-	context?: string;
-	agent?: string;
-	agentScope?: AgentScope;
-	cwd?: string;
 };
 
 export type BgAgentParamsInput = {

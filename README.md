@@ -4,9 +4,9 @@ A Pi package for delegating work to isolated child Pi agents. It registers subag
 
 ## Features
 
-- `subagent` tool: single, parallel, and chained child-agent runs
+- `subagent` tool: single, continuation, parallel, and chained child-agent runs
 - `bg_agent` tool and `/bg` command for non-blocking background runs
-- `subagent_control` tool for list/status/ask/stop/delete on existing runs
+- `subagent_control` tool for list/status/stop/delete on existing runs
 - `subagent_schedule` tool and `/subagent-schedules` command for session-scoped schedules
 - Live run viewer via `/subagent-view <runId>` or `&1` run references
 - Bundled agents: `explorer`, `planner`, `reviewer`, `worker`
@@ -83,9 +83,9 @@ Then inspect it with:
 
 | Tool | Purpose |
 |---|---|
-| `subagent` | Run one agent, parallel agents, or a chain with `{previous}` handoff. |
+| `subagent` | Run one agent, continue a completed run, run parallel agents, or run a chain with `{previous}` handoff. |
 | `bg_agent` | Start a background agent and return immediately with a run id. |
-| `subagent_control` | List, inspect, ask follow-up, stop, or delete existing runs. |
+| `subagent_control` | List, inspect, stop, or delete existing runs. |
 | `subagent_schedule` | Add/list/delete scheduled background agents for the current session. |
 
 ### `subagent` modes
@@ -93,6 +93,7 @@ Then inspect it with:
 | Mode | Shape |
 |---|---|
 | Single | `{ "agent": "reviewer", "task": "Review the current diff" }` |
+| Continue | `{ "continueFrom": "&1", "task": "Review the previous result" }` |
 | Parallel | `{ "tasks": [{ "agent": "explorer", "task": "..." }] }` |
 | Chain | `{ "chain": [{ "agent": "explorer", "task": "..." }, { "agent": "planner", "task": "Use {previous}" }] }` |
 

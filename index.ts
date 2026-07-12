@@ -26,6 +26,7 @@ import { getFinalOutput, getResultOutput, isFailedResult, truncateForParent } fr
 import {
 	SubagentManager,
 	buildRunRefContext,
+	formatRunDetails,
 	createRunRefAutocompleteProvider,
 	getBgAgentCompletions,
 	getMainSessionOwnerId,
@@ -265,20 +266,6 @@ function formatRunTime(run: SubagentRun): string {
 	return run.status;
 }
 
-function capText(text: string, max = 12_000): string {
-	return text.length > max ? `${text.slice(0, max)}\n...[truncated ${text.length - max} chars]` : text;
-}
-
-function plainDisplayItems(messages: AgentMessage[], limit = 20): string {
-	return getDisplayItems(messages)
-		.slice(-limit)
-		.map((item) => {
-			if (item.type === "toolCall") return `Tool ${item.name}: ${capText(JSON.stringify(item.args), 600)}`;
-			return capText(item.text, 2_000);
-		})
-		.join("\n\n");
-}
-
 function formatRunList(runs: readonly SubagentRun[]): string {
 	if (runs.length === 0) return "No subagents.";
 	return runs
@@ -291,24 +278,6 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 		.join("\n\n");
 }
 
-function buildFollowUpTask(run: SubagentRun, question: string, context: string | undefined): string {
-	const output = run.finalOutput || getFinalOutput(run.messages) || run.errorMessage || "(no output yet)";
-	const transcript = plainDisplayItems(run.messages);
-	return [
-		"You are a follow-up subagent continuing from a previous subagent run.",
-		"Answer the new question using the previous run context and any new main-agent context.",
-		"",
-		`Previous run: ${formatShortRunId(run.id)} (${run.id})`,
-		`Original agent: ${run.agent}`,
-		`Status: ${run.status}`,
-		`Original task:\n${run.task}`,
-		"",
-		`Previous output:\n${capText(output)}`,
-		transcript ? `\nRecent transcript:\n${capText(transcript)}` : "",
-		context ? `\nMain-agent context:\n${capText(context)}` : "",
-		`\nNew question/instruction:\n${question}`,
-	].join("\n");
-}
 
 const subagentSchedulerController = new SubagentSchedulerController();
 
@@ -397,27 +366,38 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_control",
 		label: "Subagent Control",
-		description: "Inspect and control existing subagent runs. Can ask a follow-up question by starting a new subagent with prior run context.",
-		promptSnippet: "Use subagent_control to list/status subagent runs, ask a selected run follow-up questions, stop runs, or delete runs.",
+		description: "Inspect and control existing subagent runs: list, status, stop, or delete.",
+		promptSnippet: "Use subagent_control to list/status subagent runs, stop runs, or delete runs. Use subagent continueFrom for follow-up work.",
 		promptGuidelines: [
-			"Use action=list/status before referring to subagents if the run id is unclear.",
-			"runId accepts subagent-3, &3, or 3.",
-			"action=ask starts a new follow-up subagent with the selected run's output/transcript plus your question/context; it is not live stdin to the old process.",
+			"Use action=list before referring to subagents if the run id is unclear.",
+			"runId accepts subagent-3, &3, or 3 and is required for status, stop, and delete.",
+			"Use subagent with continueFrom and task to continue a completed run; control actions never start agents.",
 		],
 		parameters: SubagentControlParamsSchema as never,
 
-		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			const params = rawParams as SubagentControlParamsInput;
 			const action = params.action ?? "list";
+			if (!["list", "status", "stop", "delete"].includes(action)) {
+				return { content: [{ type: "text", text: `Unsupported control action: ${String(action)}.` }], details: { action } };
+			}
 			const runs = subagentManager.listRuns();
 
-			if (action === "list" || action === "status") {
+			if (action === "list") {
 				return { content: [{ type: "text", text: formatRunList(runs) }], details: { action } };
+			}
+
+			if (!params.runId?.trim()) {
+				return { content: [{ type: "text", text: `action=${action} requires runId.` }], details: { action } };
 			}
 
 			const run = subagentManager.findRun(params.runId, runs);
 			if (!run) {
-				return { content: [{ type: "text", text: `Unknown subagent run: ${params.runId ?? "(missing)"}\n\n${formatRunList(runs)}` }], details: { action } };
+				return { content: [{ type: "text", text: `Unknown subagent run: ${params.runId}` }], details: { action } };
+			}
+
+			if (action === "status") {
+				return { content: [{ type: "text", text: formatRunDetails(run) }], details: { action, runId: run.id } };
 			}
 
 			if (action === "stop") {
@@ -425,53 +405,8 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: stopped ? `Stopping ${formatShortRunId(run.id)}.` : `${formatShortRunId(run.id)} is not running.` }], details: { action, runId: run.id } };
 			}
 
-			if (action === "delete") {
-				subagentManager.deleteRun(run.id);
-				return { content: [{ type: "text", text: `Deleted ${formatShortRunId(run.id)}.` }], details: { action, runId: run.id } };
-			}
-
-			const question = params.question?.trim();
-			if (!question) return { content: [{ type: "text", text: "action=ask requires question." }], details: { action, runId: run.id } };
-
-			const agentScope: AgentScope = params.agentScope ?? (run.agentSource === "project" ? "both" : "user");
-			const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
-			const agents = discovery.agents;
-			const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-			let fallbackThinkingLevel: string | undefined;
-			try {
-				fallbackThinkingLevel = pi.getThinkingLevel();
-			} catch {
-				fallbackThinkingLevel = undefined;
-			}
-
-			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
-				mode: "single",
-				agentScope,
-				packageAgentsDir: discovery.packageAgentsDir,
-				userAgentsDir: discovery.userAgentsDir,
-				projectAgentsDir: discovery.projectAgentsDir,
-				results,
-			});
-			const result = await runSingleAgent({
-				mode: "single",
-				defaultCwd: ctx.cwd,
-				agents,
-				agentName: params.agent ?? run.agent,
-				fallbackModel,
-				fallbackThinkingLevel,
-				task: buildFollowUpTask(run, question, params.context),
-				cwd: params.cwd ?? run.cwd,
-				agentScope,
-				ownerSessionId: getMainSessionOwnerId(ctx),
-				signal,
-				onUpdate: onUpdate as OnUpdateCallback | undefined,
-				makeDetails,
-			});
-
-			return {
-				content: [{ type: "text", text: isFailedResult(result) ? `Follow-up failed: ${getResultOutput(result)}` : getResultOutput(result) }],
-				details: makeDetails([result]),
-			};
+			subagentManager.deleteRun(run.id);
+			return { content: [{ type: "text", text: `Deleted ${formatShortRunId(run.id)}.` }], details: { action, runId: run.id } };
 		},
 
 		renderCall(args: SubagentControlParamsInput, theme) {
@@ -495,7 +430,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use bg_agent when the user asks to run work in the background or when the main answer does not need the result before continuing.",
 			"Use subagent instead of bg_agent when the main agent must wait for the subagent result.",
-			"After bg_agent starts a run, use subagent_control list/status/ask/stop/delete to inspect or control it.",
+			"After bg_agent starts a run, use subagent_control list/status/stop/delete to inspect or control it, or subagent continueFrom for follow-up work.",
 		],
 		parameters: BgAgentParamsSchema as never,
 
