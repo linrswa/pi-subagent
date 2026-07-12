@@ -44,6 +44,7 @@ import {
 } from "./scheduler.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import { RunPointerPersistence } from "./run-pointers.ts";
+import { OwnerRunLifecycle } from "./run-lifecycle.ts";
 import { SubagentSettingsComponent } from "./settings-ui.ts";
 import { openSubagentRunViewer } from "./viewer.ts";
 import {
@@ -202,7 +203,8 @@ const subagentSchedulerController = new SubagentSchedulerController();
 export default function (pi: ExtensionAPI) {
 	let sessionCwd = process.cwd();
 	const runPointers = new RunPointerPersistence(pi);
-	const subagentManager = new SubagentManager(pi, (run) => runPointers.tombstone(run.ownerSessionId, run.id));
+	const runLifecycle = new OwnerRunLifecycle();
+	const subagentManager = new SubagentManager(pi, (run) => runPointers.tombstone(run.ownerSessionId, run.id), runLifecycle);
 	// One observer sees all scopes. RunPointerPersistence rejects completions from
 	// background runs once their captured main-session generation is no longer active.
 	subagentRunStore.subscribeChanges((run) => runPointers.record(run));
@@ -211,6 +213,7 @@ export default function (pi: ExtensionAPI) {
 		sessionCwd = ctx.cwd;
 		const ownerSessionId = getMainSessionOwnerId(ctx);
 		subagentRunStore.setActiveOwner(ownerSessionId);
+		runLifecycle.activate(ownerSessionId);
 		try {
 			runPointers.activate(ownerSessionId, ctx.sessionManager.getBranch(), subagentRunStore);
 		} catch {
@@ -228,9 +231,12 @@ export default function (pi: ExtensionAPI) {
 		return { action: "transform", text: `${event.text}\n\n${context}` };
 	});
 
-	pi.on("session_shutdown", () => {
-		runPointers.deactivate();
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// Stop timers first. Keep pointer persistence active while runtime-owned
+		// children receive aborts and publish their terminal records.
 		subagentSchedulerController.stop();
+		await runLifecycle.shutdown(getMainSessionOwnerId(ctx));
+		runPointers.deactivate();
 	});
 
 	pi.registerCommand("subagent-view", {
@@ -599,7 +605,8 @@ export default function (pi: ExtensionAPI) {
 						step: i + 1,
 						agentScope,
 						ownerSessionId: getMainSessionOwnerId(ctx),
-						signal,
+						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
+						onRunCreated: (run) => runLifecycle.track(run),
 						onUpdate: chainUpdate,
 						makeDetails: makeDetails("chain"),
 					});
@@ -661,7 +668,8 @@ export default function (pi: ExtensionAPI) {
 						cwd: task.cwd,
 						agentScope,
 						ownerSessionId: getMainSessionOwnerId(ctx),
-						signal,
+						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
+						onRunCreated: (run) => runLifecycle.track(run),
 						onUpdate: (partial) => {
 							if (partial.details?.results[0]) {
 								allResultDetails[index] = partial.details.results[0];
@@ -704,7 +712,8 @@ export default function (pi: ExtensionAPI) {
 						agentScope,
 						ownerSessionId: getMainSessionOwnerId(ctx),
 						continueFrom: sourceRun ? { runId: sourceRun.id, sessionFile: sourceRun.sessionFile!, leafId: sourceRun.leafId! } : undefined,
-						signal,
+						signal: runLifecycle.signalFor(getMainSessionOwnerId(ctx), signal),
+						onRunCreated: (run) => runLifecycle.track(run),
 						onUpdate: onUpdate as OnUpdateCallback | undefined,
 						makeDetails: makeDetails("single"),
 					});

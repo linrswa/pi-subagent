@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "./agents.ts";
-import { branchChildSession, createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { branchChildSession, cleanupChildSession, createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import type { AgentMessage, ContinuationSource, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
@@ -114,40 +114,53 @@ export async function runSingleAgent({
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
 	// Capture this before any await: later session switches must not redirect updates.
 	const runOwnerSessionId = getChildSessionOwnerId(ownerSessionId ?? subagentRunStore.getActiveOwner());
-	// A continuation forks before spawning: the source file is never opened by
-	// the child process, so concurrent sibling continuations cannot write it.
-	const branchedSession = continueFrom ? await branchChildSession(continueFrom) : undefined;
-	const freshSession = !branchedSession && !(suppliedSessionId && suppliedSessionDir)
-		? await createFreshChildSession(runOwnerSessionId)
-		: undefined;
-	const sessionId = branchedSession?.sessionId ?? suppliedSessionId ?? freshSession!.sessionId;
-	const sessionDir = branchedSession?.sessionDir ?? suppliedSessionDir ?? freshSession!.sessionDir;
-	const sessionFile = branchedSession?.sessionFile ?? suppliedSessionFile;
-	const leafId = branchedSession?.leafId ?? suppliedLeafId;
 	const continuedFromRunId = continueFrom?.runId ?? suppliedContinuedFromRunId;
 	const continuedFromLeafId = continueFrom?.leafId ?? suppliedContinuedFromLeafId;
 	const agent = agents.find((candidate) => candidate.name === agentName);
 	const selectedModel = agent?.model ?? fallbackModel;
+	let wasAborted = false;
+	let queuedSetupPending = false;
+	let queuedTerminal = false;
+	// Create synchronously, before child-session setup. A shutdown can therefore
+	// abort a queued run instead of racing an untracked async setup operation.
 	const run = subagentRunStore.create({
-		mode,
-		ownerSessionId: runOwnerSessionId,
-		agent: agentName,
-		agentSource: agent?.source ?? "unknown",
-		task,
-		step,
-		cwd: runCwd,
-		model: selectedModel,
-		agentScope,
-		sessionId,
-		sessionDir,
-		sessionFile,
-		leafId,
-		continuedFromRunId,
-		continuedFromLeafId,
+		mode, ownerSessionId: runOwnerSessionId, agent: agentName,
+		agentSource: agent?.source ?? "unknown", task, step, cwd: runCwd,
+		model: selectedModel, agentScope, sessionId: suppliedSessionId,
+		sessionDir: suppliedSessionDir, sessionFile: suppliedSessionFile, leafId: suppliedLeafId,
+		continuedFromRunId, continuedFromLeafId,
 	});
-	onRunCreated?.(run);
+	const terminalizeQueued = (status: "aborted" | "failed", errorMessage: string) => {
+		if (queuedTerminal) return;
+		queuedTerminal = true;
+		subagentRunStore.update(run.id, {
+			status, endedAt: Date.now(), currentTool: undefined,
+			abort: undefined, errorMessage,
+		}, runOwnerSessionId);
+	};
+	const abortQueued = () => {
+		if (wasAborted) return;
+		wasAborted = true;
+		// Session branching/setup may still be awaiting. It can create a file, so
+		// its continuation owns cleanup and publication of this terminal state.
+		if (!queuedSetupPending) terminalizeQueued("aborted", "Subagent was aborted");
+	};
+	subagentRunStore.update(run.id, { abort: abortQueued }, runOwnerSessionId);
+	onRunCreated?.(subagentRunStore.get(run.id, runOwnerSessionId) ?? run);
+	const removeQueuedAbortListener = (() => {
+		if (!signal) return () => {};
+		if (signal.aborted) abortQueued();
+		else signal.addEventListener("abort", abortQueued, { once: true });
+		return () => signal.removeEventListener("abort", abortQueued);
+	})();
 
 	if (!agent) {
+		removeQueuedAbortListener();
+		if (wasAborted) throw new Error("Subagent was aborted");
+		const sessionId = suppliedSessionId;
+		const sessionDir = suppliedSessionDir;
+		const sessionFile = suppliedSessionFile;
+		const leafId = suppliedLeafId;
 		const available = agents.map((candidate) => `"${candidate.name}"`).join(", ") || "none";
 		const errorMessage = `Unknown agent: "${agentName}". Available agents: ${available}.`;
 		const failedResult: SingleResult = {
@@ -173,10 +186,54 @@ export async function runSingleAgent({
 			status: "failed",
 			endedAt: Date.now(),
 			errorMessage,
+			abort: undefined,
 			messages: failedResult.messages,
 			usage: failedResult.usage,
 		}, runOwnerSessionId);
 		return failedResult;
+	}
+
+	if (wasAborted) {
+		removeQueuedAbortListener();
+		throw new Error("Subagent was aborted");
+	}
+	// A continuation forks before spawning: the source file is never opened by
+	// the child process, so concurrent sibling continuations cannot write it.
+	let branchedSession: Awaited<ReturnType<typeof branchChildSession>> | undefined;
+	let freshSession: Awaited<ReturnType<typeof createFreshChildSession>> | undefined;
+	const cleanupBranchedSession = async () => {
+		if (!branchedSession?.sessionFile) return;
+		// The managed-path and exact-session-id checks ensure this can never remove
+		// the continuation source (or another run's branch).
+		await cleanupChildSession(branchedSession.sessionFile, branchedSession.sessionId).catch(() => {});
+		// Do not leave a terminal run pointing at a branch which was deliberately
+		// removed. The continuation source metadata remains intact.
+		subagentRunStore.update(run.id, { sessionFile: undefined, leafId: undefined }, runOwnerSessionId);
+	};
+	queuedSetupPending = true;
+	try {
+		branchedSession = continueFrom ? await branchChildSession(continueFrom) : undefined;
+		freshSession = !branchedSession && !(suppliedSessionId && suppliedSessionDir)
+			? await createFreshChildSession(runOwnerSessionId)
+			: undefined;
+	} catch (error) {
+		queuedSetupPending = false;
+		removeQueuedAbortListener();
+		await cleanupBranchedSession();
+		terminalizeQueued(wasAborted ? "aborted" : "failed", wasAborted ? "Subagent was aborted" : error instanceof Error ? error.message : String(error));
+		throw error;
+	}
+	const sessionId = branchedSession?.sessionId ?? suppliedSessionId ?? freshSession!.sessionId;
+	const sessionDir = branchedSession?.sessionDir ?? suppliedSessionDir ?? freshSession!.sessionDir;
+	const sessionFile = branchedSession?.sessionFile ?? suppliedSessionFile;
+	const leafId = branchedSession?.leafId ?? suppliedLeafId;
+	subagentRunStore.update(run.id, { sessionId, sessionDir, sessionFile, leafId }, runOwnerSessionId);
+	if (wasAborted) {
+		queuedSetupPending = false;
+		removeQueuedAbortListener();
+		await cleanupBranchedSession();
+		terminalizeQueued("aborted", "Subagent was aborted");
+		throw new Error("Subagent was aborted");
 	}
 
 	const args: string[] = ["--mode", "json", "-p"];
@@ -192,7 +249,6 @@ export async function runSingleAgent({
 
 	let tmpPromptDir: string | undefined;
 	let tmpPromptPath: string | undefined;
-	let wasAborted = false;
 	let runStatus: RunStatus = "queued";
 
 	const currentResult: SingleResult = {
@@ -255,12 +311,22 @@ export async function runSingleAgent({
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
+		if (wasAborted) {
+			queuedSetupPending = false;
+			removeQueuedAbortListener();
+			await cleanupBranchedSession();
+			terminalizeQueued("aborted", "Subagent was aborted");
+			throw new Error("Subagent was aborted");
+		}
 
 		// A branched Pi session already supplies conversation context. Its prompt
 		// must be only the newly requested task, never reconstructed history.
 		args.push(branchedSession ? task : `Task: ${task}`);
 
 		const exitCode = await new Promise<number>((resolve) => {
+			// From here spawn is synchronous and installs its own abort listener.
+			queuedSetupPending = false;
+			removeQueuedAbortListener();
 			const invocation = getPiInvocation(args);
 			let buffer = "";
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -402,10 +468,21 @@ export async function runSingleAgent({
 		markTerminal(getTerminalRunStatus(currentResult));
 		return currentResult;
 	} catch (error) {
+		if (queuedTerminal) throw error;
+		if (queuedSetupPending) {
+			queuedSetupPending = false;
+			removeQueuedAbortListener();
+			await cleanupBranchedSession();
+			terminalizeQueued(wasAborted ? "aborted" : "failed", wasAborted ? "Subagent was aborted" : error instanceof Error ? error.message : String(error));
+			throw error;
+		}
 		const message = error instanceof Error ? error.message : String(error);
+		const aborted = wasAborted || currentResult.stopReason === "aborted";
+		// Once spawned, an aborted continuation remains a valid persisted checkpoint
+		// and must stay available for status, continuation, and explicit retention cleanup.
 		currentResult.errorMessage ??= message;
 		if (currentResult.exitCode === 0 || currentResult.exitCode === -1) currentResult.exitCode = wasAborted ? 130 : 1;
-		markTerminal(wasAborted || currentResult.stopReason === "aborted" ? "aborted" : "failed");
+		markTerminal(aborted ? "aborted" : "failed");
 		throw error;
 	} finally {
 		if (tmpPromptDir) await fs.promises.rm(tmpPromptDir, { recursive: true, force: true }).catch(() => {});

@@ -5,6 +5,7 @@ import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
 import { cleanupChildSession, createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
+import { OwnerRunLifecycle } from "./run-lifecycle.ts";
 import { subagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
@@ -188,9 +189,10 @@ export async function confirmProjectAgentIfNeeded(
 	return Boolean(ok);
 }
 
-export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {
+export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: BgAgentParamsInput, lifecycle?: OwnerRunLifecycle): Promise<StartBackgroundAgentResult> {
 	// Capture before confirmation/session allocation; this promise may outlive a session switch.
 	const ownerSessionId = getMainSessionOwnerId(ctx);
+	const signal = lifecycle?.signalFor(ownerSessionId);
 	const task = params.prompt?.trim();
 	if (!task) return { ok: false, message: "bg_agent requires prompt." };
 
@@ -207,6 +209,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 
 	const ok = await confirmProjectAgentIfNeeded(ctx, discovery, agent, params.confirmProjectAgents ?? true);
 	if (!ok) return { ok: false, message: "Canceled: project-local agent not approved." };
+	if (signal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
 
 	const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	let fallbackThinkingLevel: string | undefined;
@@ -234,6 +237,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		return { ok: false, message: `Failed to allocate child session: ${error instanceof Error ? error.message : String(error)}` };
 	}
 
+	if (signal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
 	let createdRun: SubagentRun | undefined;
 	const promise = runSingleAgent({
 		mode: "single",
@@ -246,11 +250,13 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		cwd: params.cwd,
 		agentScope,
 		ownerSessionId,
+		signal,
 		sessionId: freshSession.sessionId,
 		sessionDir: freshSession.sessionDir,
 		makeDetails,
 		onRunCreated: (run) => {
 			createdRun = run;
+			lifecycle?.track(run);
 		},
 	});
 
@@ -278,10 +284,12 @@ export interface DeleteRunResult {
 export class SubagentManager {
 	private readonly pi: ExtensionAPI;
 	private readonly onRunDeleted?: (run: SubagentRun) => void;
+	private readonly lifecycle?: OwnerRunLifecycle;
 
-	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void) {
+	constructor(pi: ExtensionAPI, onRunDeleted?: (run: SubagentRun) => void, lifecycle?: OwnerRunLifecycle) {
 		this.pi = pi;
 		this.onRunDeleted = onRunDeleted;
+		this.lifecycle = lifecycle;
 	}
 
 	listRuns(): SubagentRun[] {
@@ -349,7 +357,7 @@ export class SubagentManager {
 	}
 
 	startBackground(ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {
-		return startBackgroundAgent(this.pi, ctx, params);
+		return startBackgroundAgent(this.pi, ctx, params, this.lifecycle);
 	}
 }
 
