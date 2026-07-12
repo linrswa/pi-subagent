@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents.ts";
+import type { AgentConfig, AgentScope } from "./agents.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import type { AgentMessage, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
@@ -66,6 +66,14 @@ export interface RunSingleAgentOptions {
 	task: string;
 	cwd?: string;
 	step?: number;
+	/** Child-session pointer metadata only; never child-session history. */
+	agentScope?: AgentScope;
+	sessionId?: string;
+	sessionDir?: string;
+	sessionFile?: string;
+	leafId?: string;
+	continuedFromRunId?: string;
+	continuedFromLeafId?: string;
 	signal?: AbortSignal;
 	onUpdate?: OnUpdateCallback;
 	makeDetails: (results: SingleResult[]) => SubagentDetails;
@@ -82,6 +90,13 @@ export async function runSingleAgent({
 	task,
 	cwd,
 	step,
+	agentScope,
+	sessionId,
+	sessionDir,
+	sessionFile,
+	leafId,
+	continuedFromRunId,
+	continuedFromLeafId,
 	signal,
 	onUpdate,
 	makeDetails,
@@ -98,6 +113,13 @@ export async function runSingleAgent({
 		step,
 		cwd: runCwd,
 		model: selectedModel,
+		agentScope,
+		sessionId,
+		sessionDir,
+		sessionFile,
+		leafId,
+		continuedFromRunId,
+		continuedFromLeafId,
 	});
 	onRunCreated?.(run);
 
@@ -115,6 +137,13 @@ export async function runSingleAgent({
 			usage: makeEmptyUsage(),
 			errorMessage,
 			step,
+			agentScope,
+			sessionId,
+			sessionDir,
+			sessionFile,
+			leafId,
+			continuedFromRunId,
+			continuedFromLeafId,
 		};
 		subagentRunStore.update(run.id, {
 			status: "failed",
@@ -147,6 +176,13 @@ export async function runSingleAgent({
 		usage: makeEmptyUsage(),
 		model: selectedModel,
 		step,
+		agentScope,
+		sessionId,
+		sessionDir,
+		sessionFile,
+		leafId,
+		continuedFromRunId,
+		continuedFromLeafId,
 	};
 
 	const syncRun = (patch: SubagentRunPatch = {}) => {

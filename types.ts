@@ -51,6 +51,15 @@ export interface SubagentRun {
 	errorMessage?: string;
 	usage: UsageStats;
 	model?: string;
+	/** Discovery scope used to select this run's agent. */
+	agentScope?: AgentScope;
+	/** Pointer metadata for the child session; never child-session history. */
+	sessionId?: string;
+	sessionDir?: string;
+	sessionFile?: string;
+	leafId?: string;
+	continuedFromRunId?: string;
+	continuedFromLeafId?: string;
 	abort?: () => void;
 }
 
@@ -67,6 +76,14 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	/** Pointer metadata for the child session; never child-session history. */
+	agentScope?: AgentScope;
+	sessionId?: string;
+	sessionDir?: string;
+	sessionFile?: string;
+	leafId?: string;
+	continuedFromRunId?: string;
+	continuedFromLeafId?: string;
 }
 
 export interface SubagentDetails {
@@ -156,5 +173,5 @@ export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; n
 
 export type SubagentRunSubscriber = (runs: readonly SubagentRun[]) => void;
 export type CreateSubagentRunInput = Pick<SubagentRun, "mode" | "agent" | "agentSource" | "task"> &
-	Partial<Pick<SubagentRun, "step" | "cwd" | "model">>;
+	Partial<Pick<SubagentRun, "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId">>;
 export type SubagentRunPatch = Partial<Omit<SubagentRun, "id">>;

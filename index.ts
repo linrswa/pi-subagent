@@ -459,6 +459,7 @@ export default function (pi: ExtensionAPI) {
 				fallbackThinkingLevel,
 				task: buildFollowUpTask(run, question, params.context),
 				cwd: params.cwd ?? run.cwd,
+				agentScope,
 				signal,
 				onUpdate: onUpdate as OnUpdateCallback | undefined,
 				makeDetails,
@@ -680,6 +681,7 @@ export default function (pi: ExtensionAPI) {
 						task: taskWithContext,
 						cwd: step.cwd,
 						step: i + 1,
+						agentScope,
 						signal,
 						onUpdate: chainUpdate,
 						makeDetails: makeDetails("chain"),
@@ -739,6 +741,7 @@ export default function (pi: ExtensionAPI) {
 						fallbackThinkingLevel,
 						task: task.task,
 						cwd: task.cwd,
+						agentScope,
 						signal,
 						onUpdate: (partial) => {
 							if (partial.details?.results[0]) {
@@ -777,6 +780,7 @@ export default function (pi: ExtensionAPI) {
 					fallbackThinkingLevel,
 					task: params.task,
 					cwd: params.cwd,
+					agentScope,
 					signal,
 					onUpdate: onUpdate as OnUpdateCallback | undefined,
 					makeDetails: makeDetails("single"),

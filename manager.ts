@@ -158,6 +158,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		fallbackThinkingLevel,
 		task,
 		cwd: params.cwd,
+		agentScope,
 		makeDetails,
 		onRunCreated: (run) => {
 			createdRun = run;
