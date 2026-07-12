@@ -215,7 +215,9 @@ export default function (pi: ExtensionAPI) {
 		subagentRunStore.setActiveOwner(ownerSessionId);
 		runLifecycle.activate(ownerSessionId);
 		try {
-			runPointers.activate(ownerSessionId, ctx.sessionManager.getBranch(), subagentRunStore);
+			// Pointer/tombstone state is session-global: sibling branches can reserve IDs
+			// or tombstone a run even when they are not on the active context path.
+			runPointers.activate(ownerSessionId, ctx.sessionManager.getEntries(), subagentRunStore);
 		} catch {
 			// Ephemeral/no-session parents still retain their in-process run scope.
 			runPointers.activate(ownerSessionId, [], subagentRunStore);

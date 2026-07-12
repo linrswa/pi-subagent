@@ -103,10 +103,25 @@ export class RunPointerPersistence {
 
 	activate(ownerSessionId: string, entries: readonly EntryLike[], store: SubagentRunStore): void {
 		this.generation++;
+		const generation = this.generation;
 		this.activeOwner = ownerSessionId;
 		const restored = restoreRunPointers(entries, ownerSessionId);
 		store.hydrate(ownerSessionId, restored.runs, restored.maxRunNumber);
 		this.fingerprints.clear();
+
+		// A queued/running pointer belongs to an earlier extension runtime. There
+		// is no runner to resume after activation, so close it rather than showing
+		// a permanently live run. Append the corrected, still-minimal pointer
+		// directly: retaining runGenerations preserves the guard against a late
+		// completion from an older generation.
+		const endedAt = Date.now();
+		for (const run of restored.runs) {
+			if (run.status !== "queued" && run.status !== "running") continue;
+			const reconciled = { ...run, status: "aborted" as const, endedAt };
+			// Set the fingerprint before update() notifies normal persistence.
+			this.persistReconciled(reconciled, generation);
+			store.update(run.id, { status: reconciled.status, endedAt: reconciled.endedAt }, ownerSessionId);
+		}
 	}
 
 	deactivate(): void { this.generation++; this.activeOwner = undefined; this.fingerprints.clear(); }
@@ -125,6 +140,15 @@ export class RunPointerPersistence {
 		this.pi.appendEntry(RUN_POINTER_ENTRY_TYPE, pointer);
 		this.runGenerations.set(key, generation);
 		this.fingerprints.set(key, fingerprint);
+	}
+
+	/** Persist activation-time closure without granting an old run a new generation. */
+	private persistReconciled(run: SubagentRun, generation: number): void {
+		if (generation !== this.generation || this.activeOwner !== run.ownerSessionId) return;
+		const pointer = toRunPointer(run);
+		const key = `${run.ownerSessionId}\u0000${run.id}`;
+		this.pi.appendEntry(RUN_POINTER_ENTRY_TYPE, pointer);
+		this.fingerprints.set(key, JSON.stringify(pointer));
 	}
 
 	tombstone(ownerSessionId: string, runId: string): void {

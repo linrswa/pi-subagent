@@ -43,6 +43,64 @@ test("tombstones prevent a deleted pointer from reviving and reserve its number"
 	assert.equal(store.create({ mode: "single", agent: "explorer", agentSource: "user", task: "new" }).id, "subagent-8");
 });
 
+test("complete SessionManager tree keeps sibling tombstones and high IDs on restore", async () => {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-pointer-tree-"));
+	try {
+		const manager = SessionManager.create(process.cwd(), dir, { id: "main-pointer-tree" });
+		const branchPoint = manager.appendMessage({ role: "user", content: "branch here", timestamp: Date.now() } as any);
+		manager.appendCustomEntry(RUN_POINTER_ENTRY_TYPE, toRunPointer(run("subagent-2")));
+		manager.appendCustomEntry(RUN_TOMBSTONE_ENTRY_TYPE, { version: 1, runId: "subagent-2" });
+		manager.appendCustomEntry(RUN_POINTER_ENTRY_TYPE, toRunPointer(run("subagent-91")));
+
+		// The active sibling cannot see the tombstone or high ID via getBranch().
+		manager.branch(branchPoint);
+		manager.appendCustomEntry(RUN_POINTER_ENTRY_TYPE, toRunPointer(run("subagent-2")));
+		assert.equal(restoreRunPointers(manager.getBranch(), "main-A").maxRunNumber, 2);
+
+		const restored = restoreRunPointers(manager.getEntries(), "main-A");
+		assert.equal(restored.runs.some((entry) => entry.id === "subagent-2"), false);
+		assert.equal(restored.maxRunNumber, 91);
+		const store = new SubagentRunStore();
+		store.setActiveOwner("main-A");
+		store.hydrate("main-A", restored.runs, restored.maxRunNumber);
+		assert.equal(store.create({ mode: "single", agent: "explorer", agentSource: "user", task: "new" }).id, "subagent-92");
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("activation closes stale runtime pointers and persists their terminal metadata", async () => {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-pointer-stale-"));
+	try {
+		const manager = SessionManager.create(process.cwd(), dir, { id: "main-pointer-stale" });
+		// Pi materializes a branch only after an assistant response.
+		manager.appendMessage({ role: "user", content: "resume", timestamp: Date.now() } as any);
+		manager.appendMessage({ role: "assistant", content: "resuming", provider: "test", model: "test", timestamp: Date.now() } as any);
+		const stale = { ...toRunPointer(run("subagent-4")), status: "running" as const };
+		delete stale.endedAt;
+		const queued = { ...toRunPointer(run("subagent-5")), status: "queued" as const };
+		delete queued.endedAt;
+		manager.appendCustomEntry(RUN_POINTER_ENTRY_TYPE, stale);
+		manager.appendCustomEntry(RUN_POINTER_ENTRY_TYPE, queued);
+
+		const persistence = new RunPointerPersistence({
+			appendEntry: (type: string, data: unknown) => manager.appendCustomEntry(type, data),
+		} as any);
+		const store = new SubagentRunStore();
+		persistence.activate("main-A", manager.getEntries(), store);
+		for (const id of ["subagent-4", "subagent-5"]) {
+			const reconciled = store.get(id, "main-A");
+			assert.equal(reconciled?.status, "aborted");
+			assert.ok(reconciled?.endedAt);
+		}
+
+		const reloaded = SessionManager.open(manager.getSessionFile()!);
+		const restored = new Map(restoreRunPointers(reloaded.getEntries(), "main-A").runs.map((entry) => [entry.id, entry]));
+		for (const id of ["subagent-4", "subagent-5"]) {
+			assert.equal(restored.get(id)?.status, "aborted");
+			assert.ok(restored.get(id)?.endedAt);
+		}
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("custom pointer entries are excluded from buildSessionContext", async () => {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-pointer-"));
 	try {
