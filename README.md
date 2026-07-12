@@ -112,7 +112,7 @@ Optional fields: `cwd`, `agentScope`, and `confirmProjectAgents`.
 | `/explorer-and-plan <task>` | `explorer → planner`, no implementation. |
 | `/implement-and-review <task>` | `worker → reviewer → worker`. |
 
-Run refs like `&1` can be used in normal prompts; Pi injects the previous run context automatically.
+Run refs like `&1` can be used in normal prompts; Pi injects run metadata and tool guidance, not the prior child conversation history. Use `continueFrom` to fork a completed run's persisted session for follow-up work.
 
 ## Agents
 
@@ -172,7 +172,7 @@ Project settings override global settings. These defaults override agent frontma
 
 Project-local agents are repo-controlled prompts. They are only loaded with `agentScope: "both"` or `"project"`, and TUI mode asks for confirmation by default.
 
-Child agents run as separate `pi --mode json -p --no-session` processes with `subagent`, `bg_agent`, and `subagent_schedule` excluded to prevent recursive delegation.
+Child agents run in separate persisted managed Pi sessions, with `subagent`, `bg_agent`, and `subagent_schedule` excluded to prevent recursive delegation.
 
 ## Development
 

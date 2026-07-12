@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { buildRunRefContext, getMode, getRunRefCompletions } from "../manager.ts";
+import { buildRunRefContext, getContinuationCallDisplay, getMode, getRunRefCompletions } from "../manager.ts";
 import { findRunByRef } from "../run-refs.ts";
 import { SubagentParamsSchema } from "../schemas.ts";
 import { subagentRunStore } from "../store.ts";
@@ -22,12 +22,58 @@ test("continuation source references resolve all public run-id forms", () => {
 	for (const ref of ["subagent-3", "&3", "3"]) assert.equal(findRunByRef(ref, [run]), run);
 });
 
+test("continuation call display inherits source metadata and marks an unresolved source unknown", () => {
+	const source = {
+		id: "subagent-42",
+		agent: "project-agent",
+		agentSource: "project",
+		agentScope: "project",
+	} as SubagentRun;
+	assert.deepEqual(getContinuationCallDisplay({ continueFrom: "&42", task: "follow up" }, source), {
+		agentName: "project-agent",
+		agentScope: "project",
+	});
+	assert.deepEqual(getContinuationCallDisplay({ continueFrom: "&42", task: "follow up" }, { ...source, agentScope: "both" }), {
+		agentName: "project-agent",
+		agentScope: "both",
+	});
+	assert.deepEqual(getContinuationCallDisplay({ continueFrom: "&404", task: "follow up" }), {
+		agentName: "unknown",
+		agentScope: "unknown",
+	});
+});
+
+test("run-ref context recommends continuation only for fully closed eligible sources", () => {
+	const queued = subagentRunStore.create({ mode: "single", agent: "explorer", agentSource: "user", task: "queued" });
+	const stopping = subagentRunStore.create({ mode: "single", agent: "explorer", agentSource: "user", task: "stopping" });
+	const closed = subagentRunStore.create({
+		mode: "single", agent: "explorer", agentSource: "user", task: "closed", status: "completed", endedAt: Date.now(),
+		cwd: "/tmp", sessionFile: "/tmp/child.jsonl", leafId: "leaf",
+	});
+	try {
+		subagentRunStore.update(stopping.id, { status: "aborted", abort: () => {} });
+		const context = buildRunRefContext(`Check ${formatRunRef(queued.id)} ${formatRunRef(stopping.id)} ${formatRunRef(closed.id)}`);
+		assert.ok(context);
+		assert.match(context, new RegExp(`${formatRunRef(queued.id).replace("&", "\\&")}[^\\n]*wait for it to finish and check its status`));
+		assert.match(context, new RegExp(`${formatRunRef(stopping.id).replace("&", "\\&")}[^\\n]*stopping; wait for it to fully close`));
+		assert.match(context, new RegExp(`continueFrom: "${formatRunRef(closed.id)}"`));
+		assert.doesNotMatch(context, new RegExp(`continueFrom: "${formatRunRef(queued.id)}"|continueFrom: "${formatRunRef(stopping.id)}"`));
+	} finally {
+		for (const run of [queued, stopping, closed]) subagentRunStore.remove(run.id);
+	}
+});
+
 test("run-ref context directs follow-ups to continueFrom and autocomplete stays concise", () => {
 	const run = subagentRunStore.create({
 		mode: "single",
 		agent: "explorer",
 		agentSource: "user",
 		task: "Investigate the continuation implementation and report all relevant session details.",
+		status: "completed",
+		endedAt: Date.now(),
+		cwd: "/tmp",
+		sessionFile: "/tmp/child.jsonl",
+		leafId: "leaf",
 	});
 	try {
 		const context = buildRunRefContext(`Continue ${formatRunRef(run.id)}`);

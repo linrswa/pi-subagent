@@ -72,6 +72,23 @@ export function getBgAgentCompletions(cwd: string, prefix: string): Autocomplete
 	return items.length > 0 ? items : null;
 }
 
+export function getContinuationCallDisplay(
+	params: SubagentParamsInput,
+	sourceRun = params.continueFrom ? findRunByRef(params.continueFrom) : undefined,
+): { agentName: string; agentScope: AgentScope | "unknown" } {
+	if (!params.continueFrom) {
+		return { agentName: params.agent ?? "...", agentScope: params.agentScope ?? "user" };
+	}
+
+	// Calls render before execution has resolved continuation metadata. Reuse
+	// the visible source when available; otherwise do not imply user scope.
+	const inheritedScope = sourceRun?.agentScope ?? (sourceRun?.agentSource === "project" ? "both" : sourceRun ? "user" : "unknown");
+	return {
+		agentName: params.agent ?? sourceRun?.agent ?? "unknown",
+		agentScope: params.agentScope ?? inheritedScope,
+	};
+}
+
 export function getRunRefCompletions(token: string): AutocompleteItem[] {
 	const query = token.trim().replace(/^[&＆]/, "").toLowerCase();
 	return subagentRunStore
@@ -141,10 +158,19 @@ export function buildRunRefContext(text: string): string | undefined {
 	const lines = refs
 		.map((ref) => findRunByRef(ref))
 		.filter((run): run is SubagentRun => Boolean(run))
-		.map((run) => [
-			`- ${formatShortRunId(run.id)} = ${run.id} (${run.status} ${run.agent}); use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete.`,
-			`For follow-up work, call subagent with { continueFrom: "${formatShortRunId(run.id)}", task: "..." }.`,
-		].join(" "));
+		.map((run) => {
+			const statusGuidance = `use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete.`;
+			const fullyClosed = ["completed", "failed", "aborted"].includes(run.status) && run.endedAt !== undefined && !run.abort;
+			const continuationEligible = fullyClosed && Boolean(run.sessionFile && run.leafId && run.cwd);
+			const followUp = continuationEligible
+				? `For follow-up work, call subagent with { continueFrom: "${formatShortRunId(run.id)}", task: "..." }.`
+				: run.abort || (run.status === "aborted" && run.endedAt === undefined)
+					? "This run is stopping; wait for it to fully close, then check its status before continuing."
+					: !fullyClosed
+						? `This run is ${run.status}; wait for it to finish and check its status before continuing.`
+						: "This run is closed but not eligible for continuation; check its status for details.";
+			return `- ${formatShortRunId(run.id)} = ${run.id} (${run.status} ${run.agent}); ${statusGuidance} ${followUp}`;
+		});
 	return lines.length > 0 ? `Subagent run refs:\n${lines.join("\n")}` : undefined;
 }
 

@@ -31,6 +31,7 @@ import {
 	getBgAgentCompletions,
 	getMainSessionOwnerId,
 	getMode,
+	getContinuationCallDisplay,
 	getRunRefCompletions,
 	normalizeAgentRef,
 } from "./manager.ts";
@@ -794,8 +795,8 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args: SubagentParamsInput, theme, context: { expanded?: boolean }) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			const scopeSuffix = theme.fg("muted", ` [${scope}]`);
+			const callDisplay = getContinuationCallDisplay(args);
+			const scopeSuffix = theme.fg("muted", ` [${callDisplay.agentScope}]`);
 
 			if (!context?.expanded) {
 				if (args.chain && args.chain.length > 0) {
@@ -815,7 +816,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 
-				const agentName = args.agent || "...";
+				const agentName = callDisplay.agentName;
 				const continuation = formatContinuedFrom(args.continueFrom);
 				return new Text(
 					`${theme.fg("warning", "⏳")} ${theme.fg("accent", agentName)}: ${theme.fg("dim", compactPreview(args.task, 72))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scopeSuffix}`,
@@ -828,7 +829,7 @@ export default function (pi: ExtensionAPI) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${callDisplay.agentScope}]`);
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
 					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
@@ -843,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${callDisplay.agentScope}]`);
 				for (const task of args.tasks.slice(0, 3)) {
 					const preview = task.task.length > 48 ? `${task.task.slice(0, 48)}...` : task.task;
 					text += `\n  ${theme.fg("accent", task.agent)}${theme.fg("dim", ` ${preview}`)}`;
@@ -852,13 +853,13 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			}
 
-			const agentName = args.agent || "...";
+			const agentName = callDisplay.agentName;
 			const preview = args.task ? (args.task.length > 72 ? `${args.task.slice(0, 72)}...` : args.task) : "...";
 			const continuation = formatContinuedFrom(args.continueFrom);
 			return new Text(
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", agentName) +
-					theme.fg("muted", ` [${scope}]`) +
+					theme.fg("muted", ` [${callDisplay.agentScope}]`) +
 					(continuation ? `\n  ${theme.fg("muted", continuation)}` : "") +
 					`\n  ${theme.fg("dim", preview)}`,
 				0,
