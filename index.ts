@@ -450,20 +450,19 @@ export default function (pi: ExtensionAPI) {
 				projectAgentsDir: discovery.projectAgentsDir,
 				results,
 			});
-			const result = await runSingleAgent(
-				"single",
-				ctx.cwd,
+			const result = await runSingleAgent({
+				mode: "single",
+				defaultCwd: ctx.cwd,
 				agents,
-				params.agent ?? run.agent,
+				agentName: params.agent ?? run.agent,
 				fallbackModel,
 				fallbackThinkingLevel,
-				buildFollowUpTask(run, question, params.context),
-				params.cwd ?? run.cwd,
-				undefined,
+				task: buildFollowUpTask(run, question, params.context),
+				cwd: params.cwd ?? run.cwd,
 				signal,
-				onUpdate as OnUpdateCallback | undefined,
+				onUpdate: onUpdate as OnUpdateCallback | undefined,
 				makeDetails,
-			);
+			});
 
 			return {
 				content: [{ type: "text", text: isFailedResult(result) ? `Follow-up failed: ${getResultOutput(result)}` : getResultOutput(result) }],
@@ -671,20 +670,20 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-					const result = await runSingleAgent(
-						"chain",
-						ctx.cwd,
+					const result = await runSingleAgent({
+						mode: "chain",
+						defaultCwd: ctx.cwd,
 						agents,
-						step.agent,
+						agentName: step.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
-						taskWithContext,
-						step.cwd,
-						i + 1,
+						task: taskWithContext,
+						cwd: step.cwd,
+						step: i + 1,
 						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
+						onUpdate: chainUpdate,
+						makeDetails: makeDetails("chain"),
+					});
 					results.push(result);
 
 					if (isFailedResult(result)) {
@@ -731,25 +730,24 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (task, index) => {
-					const result = await runSingleAgent(
-						"parallel",
-						ctx.cwd,
+					const result = await runSingleAgent({
+						mode: "parallel",
+						defaultCwd: ctx.cwd,
 						agents,
-						task.agent,
+						agentName: task.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
-						task.task,
-						task.cwd,
-						undefined,
+						task: task.task,
+						cwd: task.cwd,
 						signal,
-						(partial) => {
+						onUpdate: (partial) => {
 							if (partial.details?.results[0]) {
 								allResults[index] = partial.details.results[0];
 								emitParallelUpdate();
 							}
 						},
-						makeDetails("parallel"),
-					);
+						makeDetails: makeDetails("parallel"),
+					});
 					allResults[index] = result;
 					emitParallelUpdate();
 					return result;
@@ -770,20 +768,19 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (mode === "single" && params.agent && params.task) {
-				const result = await runSingleAgent(
-					"single",
-					ctx.cwd,
+				const result = await runSingleAgent({
+					mode: "single",
+					defaultCwd: ctx.cwd,
 					agents,
-					params.agent,
+					agentName: params.agent,
 					fallbackModel,
 					fallbackThinkingLevel,
-					params.task,
-					params.cwd,
-					undefined,
+					task: params.task,
+					cwd: params.cwd,
 					signal,
-					onUpdate as OnUpdateCallback | undefined,
-					makeDetails("single"),
-				);
+					onUpdate: onUpdate as OnUpdateCallback | undefined,
+					makeDetails: makeDetails("single"),
+				});
 
 				return {
 					content: [{ type: "text", text: isFailedResult(result) ? `Agent failed: ${getResultOutput(result)}` : getResultOutput(result) }],

@@ -149,23 +149,20 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		results,
 	});
 	let createdRun: SubagentRun | undefined;
-	const promise = runSingleAgent(
-		"single",
-		ctx.cwd,
-		discovery.agents,
+	const promise = runSingleAgent({
+		mode: "single",
+		defaultCwd: ctx.cwd,
+		agents: discovery.agents,
 		agentName,
 		fallbackModel,
 		fallbackThinkingLevel,
 		task,
-		params.cwd,
-		undefined,
-		undefined,
-		undefined,
+		cwd: params.cwd,
 		makeDetails,
-		(run) => {
+		onRunCreated: (run) => {
 			createdRun = run;
 		},
-	);
+	});
 
 	void promise
 		.then((result) => {

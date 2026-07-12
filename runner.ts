@@ -56,21 +56,37 @@ function resolveChildCwd(defaultCwd: string, cwd: string | undefined): string {
 	return cwd ? path.resolve(defaultCwd, cwd) : defaultCwd;
 }
 
-export async function runSingleAgent(
-	mode: SubagentMode,
-	defaultCwd: string,
-	agents: AgentConfig[],
-	agentName: string,
-	fallbackModel: string | undefined,
-	fallbackThinkingLevel: string | undefined,
-	task: string,
-	cwd: string | undefined,
-	step: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	onRunCreated?: (run: SubagentRun) => void,
-): Promise<SingleResult> {
+export interface RunSingleAgentOptions {
+	mode: SubagentMode;
+	defaultCwd: string;
+	agents: AgentConfig[];
+	agentName: string;
+	fallbackModel?: string;
+	fallbackThinkingLevel?: string;
+	task: string;
+	cwd?: string;
+	step?: number;
+	signal?: AbortSignal;
+	onUpdate?: OnUpdateCallback;
+	makeDetails: (results: SingleResult[]) => SubagentDetails;
+	onRunCreated?: (run: SubagentRun) => void;
+}
+
+export async function runSingleAgent({
+	mode,
+	defaultCwd,
+	agents,
+	agentName,
+	fallbackModel,
+	fallbackThinkingLevel,
+	task,
+	cwd,
+	step,
+	signal,
+	onUpdate,
+	makeDetails,
+	onRunCreated,
+}: RunSingleAgentOptions): Promise<SingleResult> {
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
 	const agent = agents.find((candidate) => candidate.name === agentName);
 	const selectedModel = agent?.model ?? fallbackModel;
