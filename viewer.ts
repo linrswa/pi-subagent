@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, type Component, type OverlayOptions, type TUI } from "@earendil-works/pi-tui";
+import { readChildSessionMessages } from "./child-sessions.ts";
 import { getFinalOutput } from "./results.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import { subagentRunStore } from "./store.ts";
@@ -115,6 +116,8 @@ class SubagentRunViewerComponent implements Component {
 	private confirmStop = false;
 	private lastBodyRows = 1;
 	private lastBodyLineCount = 0;
+	private persistedMessages: SubagentRun["messages"] | undefined;
+	private loadedSessionFile: string | undefined;
 	private readonly unsubscribe: () => void;
 
 	constructor(
@@ -127,6 +130,15 @@ class SubagentRunViewerComponent implements Component {
 	) {
 		this.unsubscribe = subagentRunStore.subscribe((runs) => {
 			this.run = runs.find((candidate) => candidate.id === runId && candidate.ownerSessionId === ownerSessionId);
+			if (this.run && this.run.status !== "running" && this.run.status !== "queued" && this.run.sessionFile && this.loadedSessionFile !== this.run.sessionFile) {
+				this.loadedSessionFile = this.run.sessionFile;
+				void readChildSessionMessages(this.run.sessionFile, this.run.leafId)
+					.then((messages) => {
+						this.persistedMessages = messages;
+						this.tui.requestRender();
+					})
+					.catch(() => {});
+			}
 			this.followTail ||= this.scrollTop >= this.maxScroll();
 			this.tui.requestRender();
 		}, ownerSessionId);
@@ -197,7 +209,10 @@ class SubagentRunViewerComponent implements Component {
 	private bodyLines(run: SubagentRun | undefined): string[] {
 		if (!run) return [this.theme.fg("warning", `Subagent ${this.runId} was deleted`)];
 		const lines: string[] = [];
-		for (const message of run.messages) {
+		// Live runs use the in-memory store. Completed runs reload their active
+		// branch from the child session, rather than relying on parent details.
+		const messages = run.status === "running" || run.status === "queued" ? run.messages : (this.persistedMessages ?? run.messages);
+		for (const message of messages) {
 			const usage = message.usage
 				? formatUsageStats(
 					{
@@ -226,7 +241,7 @@ class SubagentRunViewerComponent implements Component {
 			if (usage) lines.push(this.theme.fg("dim", usage));
 		}
 
-		const finalOutput = run.finalOutput || getFinalOutput(run.messages);
+		const finalOutput = run.finalOutput || getFinalOutput(messages);
 		if (finalOutput) {
 			lines.push("", this.theme.fg("muted", "── final output"));
 			this.pushText(lines, finalOutput);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { getChildSessionsRoot } from "../child-sessions.ts";
+import { getChildSessionsRoot, readChildSessionMessages } from "../child-sessions.ts";
 import { runSingleAgent } from "../runner.ts";
 import { subagentRunStore } from "../store.ts";
 import type { SubagentDetails } from "../types.ts";
@@ -114,6 +114,11 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 			assert.equal(stored?.leafId, result.leafId);
 			const context = SessionManager.open(result.sessionFile!).buildSessionContext();
 			assert.deepEqual(context.messages.map((message) => message.content), ["child task", "child answer"]);
+			const viewerMessages = await readChildSessionMessages(result.sessionFile!, result.leafId);
+			assert.deepEqual(viewerMessages.map((message) => message.content), [
+				[{ type: "text", text: "child task" }],
+				[{ type: "text", text: "child answer" }],
+			]);
 		}
 		assert.notEqual(first.sessionId, second.sessionId);
 		assert.notEqual(first.sessionFile, second.sessionFile);

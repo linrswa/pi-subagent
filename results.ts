@@ -1,5 +1,5 @@
 import { PER_TASK_OUTPUT_CAP } from "./constants.ts";
-import type { AgentMessage, SingleResult, TextContent, ToolCallContent } from "./types.ts";
+import type { AgentMessage, ParentResult, SingleResult, TextContent, ToolCallContent } from "./types.ts";
 
 export function getAssistantText(message: AgentMessage): string {
 	return message.content
@@ -50,4 +50,18 @@ export function getLastToolCallName(message: AgentMessage): string | undefined {
 export function getTerminalRunStatus(result: SingleResult): "completed" | "failed" | "aborted" {
 	if (result.stopReason === "aborted") return "aborted";
 	return isFailedResult(result) ? "failed" : "completed";
+}
+
+/** Build the parent-persisted view without copying a child transcript. */
+export function toParentResult(result: SingleResult): ParentResult {
+	return {
+		runId: result.runId,
+		agent: result.agent,
+		status: result.exitCode === -1 ? "running" : getTerminalRunStatus(result),
+		finalOutput: getResultOutput(result),
+		usage: result.usage,
+		model: result.model,
+		sessionId: result.sessionId,
+		continuedFromRunId: result.continuedFromRunId,
+	};
 }

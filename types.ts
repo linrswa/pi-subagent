@@ -95,13 +95,29 @@ export interface SingleResult {
 	continuedFromLeafId?: string;
 }
 
+/**
+ * The intentionally small child-run record stored in the parent tool result.
+ * Child transcripts stay in the run store while live and in the child session
+ * after completion; never put `messages` here.
+ */
+export interface ParentResult {
+	runId?: string;
+	agent: string;
+	status: Exclude<RunStatus, "queued">;
+	finalOutput: string;
+	usage: UsageStats;
+	model?: string;
+	sessionId?: string;
+	continuedFromRunId?: string;
+}
+
 export interface SubagentDetails {
 	mode: SubagentMode;
 	agentScope: AgentScope;
 	packageAgentsDir: string;
 	userAgentsDir: string;
 	projectAgentsDir: string | null;
-	results: SingleResult[];
+	results: ParentResult[];
 }
 
 export type ToolTextResult = {

@@ -137,6 +137,22 @@ export async function assertManagedChildSessionPath(sessionFile: string): Promis
  * SessionManager performs the header/cwd validation rather than this helper
  * parsing JSONL itself.
  */
+/** Read the active branch of a completed child session for UI display only. */
+export async function readChildSessionMessages(sessionFile: string, leafId?: string): Promise<import("./types.ts").AgentMessage[]> {
+	const managedFile = await assertManagedChildSessionPath(sessionFile);
+	const manager = SessionManager.open(managedFile, path.dirname(managedFile));
+	return manager
+		.getBranch(leafId)
+		.filter((entry) => entry.type === "message")
+		.map((entry) => {
+			const message = (entry as unknown as { message: { content?: unknown; [key: string]: unknown } }).message;
+			const content = typeof message.content === "string"
+				? [{ type: "text", text: message.content }]
+				: Array.isArray(message.content) ? message.content : [];
+			return { ...message, content } as import("./types.ts").AgentMessage;
+		});
+}
+
 export async function findChildSession(sessionId: string, cwd: string, sessionDir: string): Promise<ChildSessionRef | undefined> {
 	assertValidChildSessionId(sessionId);
 	const resolvedDir = path.resolve(sessionDir);

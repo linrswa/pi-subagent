@@ -18,11 +18,10 @@ import {
 } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList, getAgentModelDefaults, setAgentModelDefault } from "./agents.ts";
 import {
-	COLLAPSED_ITEM_COUNT,
 	MAX_CONCURRENCY,
 	MAX_PARALLEL_TASKS,
 } from "./constants.ts";
-import { getFinalOutput, getResultOutput, isFailedResult, truncateForParent } from "./results.ts";
+import { getFinalOutput, getResultOutput, isFailedResult, toParentResult, truncateForParent } from "./results.ts";
 import {
 	SubagentManager,
 	buildRunRefContext,
@@ -53,10 +52,9 @@ import {
 	SubagentScheduleParamsSchema,
 } from "./schemas.ts";
 import type {
-	AgentMessage,
 	BgAgentParamsInput,
-	DisplayItem,
 	OnUpdateCallback,
+	ParentResult,
 	SingleResult,
 	SubagentControlParamsInput,
 	SubagentDetails,
@@ -64,8 +62,6 @@ import type {
 	SubagentParamsInput,
 	SubagentRun,
 	SubagentScheduleParamsInput,
-	TextContent,
-	ToolCallContent,
 	UsageStats,
 } from "./types.ts";
 
@@ -107,73 +103,8 @@ function shortenPath(filePath: string): string {
 	return filePath.startsWith(home) ? `~${filePath.slice(home.length)}` : filePath;
 }
 
-function formatToolCall(toolName: string, args: Record<string, unknown>, theme: ExtensionContext["ui"]["theme"]): string {
-	switch (toolName) {
-		case "bash": {
-			const command = typeof args.command === "string" ? args.command : "...";
-			const preview = command.length > 72 ? `${command.slice(0, 72)}...` : command;
-			return theme.fg("muted", "$ ") + theme.fg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = String(args.path ?? args.file_path ?? "...");
-			const offset = typeof args.offset === "number" ? args.offset : undefined;
-			const limit = typeof args.limit === "number" ? args.limit : undefined;
-			let text = theme.fg("accent", shortenPath(rawPath));
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return theme.fg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = String(args.path ?? args.file_path ?? "...");
-			const content = typeof args.content === "string" ? args.content : "";
-			const lines = content ? content.split("\n").length : 0;
-			return theme.fg("muted", "write ") + theme.fg("accent", shortenPath(rawPath)) + (lines ? theme.fg("dim", ` (${lines} lines)`) : "");
-		}
-		case "edit":
-			return theme.fg("muted", "edit ") + theme.fg("accent", shortenPath(String(args.path ?? args.file_path ?? "...")));
-		case "ls":
-			return theme.fg("muted", "ls ") + theme.fg("accent", shortenPath(String(args.path ?? ".")));
-		case "find":
-			return (
-				theme.fg("muted", "find ") +
-				theme.fg("accent", String(args.pattern ?? "*")) +
-				theme.fg("dim", ` in ${shortenPath(String(args.path ?? "."))}`)
-			);
-		case "grep":
-			return (
-				theme.fg("muted", "grep ") +
-				theme.fg("accent", `/${String(args.pattern ?? "")}/`) +
-				theme.fg("dim", ` in ${shortenPath(String(args.path ?? "."))}`)
-			);
-		default: {
-			const argsText = JSON.stringify(args);
-			const preview = argsText.length > 60 ? `${argsText.slice(0, 60)}...` : argsText;
-			return theme.fg("accent", toolName) + theme.fg("dim", ` ${preview}`);
-		}
-	}
-}
 
-function getDisplayItems(messages: AgentMessage[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const message of messages) {
-		if (message.role !== "assistant") continue;
-		for (const part of message.content) {
-			if (part.type === "text" && typeof (part as TextContent).text === "string") {
-				const text = (part as TextContent).text.trim();
-				if (text) items.push({ type: "text", text });
-			} else if (part.type === "toolCall") {
-				const toolCall = part as ToolCallContent;
-				items.push({ type: "toolCall", name: toolCall.name, args: toolCall.arguments ?? {} });
-			}
-		}
-	}
-	return items;
-}
-
-function aggregateUsage(results: SingleResult[]): Omit<UsageStats, "contextTokens"> {
+function aggregateUsage(results: Array<Pick<SingleResult, "usage">>): Omit<UsageStats, "contextTokens"> {
 	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 	for (const result of results) {
 		total.input += result.usage.input;
@@ -186,29 +117,10 @@ function aggregateUsage(results: SingleResult[]): Omit<UsageStats, "contextToken
 	return total;
 }
 
-function renderDisplayItems(
-	items: DisplayItem[],
-	limit: number | undefined,
-	expanded: boolean,
-	theme: ExtensionContext["ui"]["theme"],
-): string {
-	const toShow = limit ? items.slice(-limit) : items;
-	const skipped = limit && items.length > limit ? items.length - limit : 0;
-	let text = skipped > 0 ? theme.fg("muted", `... ${skipped} earlier items\n`) : "";
-	for (const item of toShow) {
-		if (item.type === "toolCall") {
-			text += `${theme.fg("muted", "→ ")}${formatToolCall(item.name, item.args, theme)}\n`;
-		} else {
-			const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-			text += `${theme.fg("toolOutput", preview)}\n`;
-		}
-	}
-	return text.trimEnd();
-}
 
-function resultIcon(result: SingleResult, theme: ExtensionContext["ui"]["theme"]): string {
-	if (result.exitCode === -1) return theme.fg("warning", "⏳");
-	return isFailedResult(result) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+function resultIcon(result: ParentResult, theme: ExtensionContext["ui"]["theme"]): string {
+	if (result.status === "running") return theme.fg("warning", "⏳");
+	return result.status === "failed" || result.status === "aborted" ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
 function compactPreview(text: string | undefined, maxLength: number): string {
@@ -221,17 +133,15 @@ function formatContinuedFrom(runId: string | undefined): string {
 	return runId ? `continued from ${formatShortRunId(runId)}` : "";
 }
 
-function resultStatusLabel(result: SingleResult): "running" | "completed" | "failed" | "aborted" {
-	if (result.exitCode === -1) return "running";
-	if (result.stopReason === "aborted") return "aborted";
-	return isFailedResult(result) ? "failed" : "completed";
+function resultStatusLabel(result: ParentResult): ParentResult["status"] {
+	return result.status;
 }
 
 function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["ui"]["theme"]): Container {
 	const container = new Container();
-	const running = details.results.filter((entry) => entry.exitCode === -1).length;
-	const failed = details.results.filter((entry) => entry.exitCode !== -1 && isFailedResult(entry)).length;
-	const succeeded = details.results.filter((entry) => entry.exitCode !== -1 && !isFailedResult(entry)).length;
+	const running = details.results.filter((entry) => entry.status === "running").length;
+	const failed = details.results.filter((entry) => entry.status === "failed" || entry.status === "aborted").length;
+	const succeeded = details.results.filter((entry) => entry.status === "completed").length;
 	const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
 	const scope = theme.fg("muted", ` [${details.agentScope}]`);
 	let line: string;
@@ -239,17 +149,17 @@ function renderCompactResult(details: SubagentDetails, theme: ExtensionContext["
 	if (details.mode === "single") {
 		const entry = details.results[0];
 		const continuation = formatContinuedFrom(entry.continuedFromRunId);
-		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}: ${theme.fg("dim", compactPreview(entry.task, 72))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scope}`;
+		line = `${resultIcon(entry, theme)} ${theme.fg("accent", entry.agent)} ${theme.fg("muted", resultStatusLabel(entry))}${continuation ? theme.fg("muted", ` ${continuation}`) : ""}${scope}`;
 	} else if (details.mode === "parallel") {
 		const done = succeeded + failed;
 		const summary = running > 0 ? `${running} running, ${done} done` : `${succeeded}/${details.results.length} succeeded${failed ? `, ${failed} failed` : ""}`;
 		line = `${topIcon} ${theme.fg("accent", "subagents")}: ${theme.fg("dim", summary)}${scope}`;
 	} else {
-		const runningIndex = details.results.findIndex((entry) => entry.exitCode === -1);
-		const failedIndex = details.results.findIndex((entry) => entry.exitCode !== -1 && isFailedResult(entry));
+		const runningIndex = details.results.findIndex((entry) => entry.status === "running");
+		const failedIndex = details.results.findIndex((entry) => entry.status === "failed" || entry.status === "aborted");
 		const activeIndex = runningIndex !== -1 ? runningIndex : failedIndex !== -1 ? failedIndex : details.results.length - 1;
 		const entry = details.results[activeIndex];
-		const step = entry.step ?? activeIndex + 1;
+		const step = activeIndex + 1;
 		line = `${topIcon} ${theme.fg("accent", `chain step ${step}/${details.results.length}`)}: ${theme.fg("dim", `${entry.agent} ${resultStatusLabel(entry)}`)}${scope}`;
 	}
 
@@ -579,9 +489,9 @@ export default function (pi: ExtensionAPI) {
 				fallbackThinkingLevel = undefined;
 			}
 
-			const makeDetails =
+			const makeDetailsFromParent =
 				(selectedMode: SubagentMode) =>
-				(results: SingleResult[]): SubagentDetails => ({
+				(results: ParentResult[]): SubagentDetails => ({
 					mode: selectedMode,
 					agentScope,
 					packageAgentsDir: discovery.packageAgentsDir,
@@ -589,6 +499,9 @@ export default function (pi: ExtensionAPI) {
 					projectAgentsDir: discovery.projectAgentsDir,
 					results,
 				});
+			const makeDetails =
+				(selectedMode: SubagentMode) =>
+				(results: SingleResult[]): SubagentDetails => makeDetailsFromParent(selectedMode)(results.map(toParentResult));
 
 			if (!mode) {
 				const list = formatAgentList(agents);
@@ -654,7 +567,7 @@ export default function (pi: ExtensionAPI) {
 						? (partial) => {
 								const currentResult = partial.details?.results[0];
 								if (!currentResult) return;
-								onUpdate({ content: partial.content, details: makeDetails("chain")([...results, currentResult]) });
+								onUpdate({ content: partial.content, details: makeDetailsFromParent("chain")([...results.map(toParentResult), currentResult]) });
 							}
 						: undefined;
 
@@ -710,12 +623,13 @@ export default function (pi: ExtensionAPI) {
 					usage: makeEmptyUsage(),
 				}));
 
+				const allResultDetails = allResults.map(toParentResult);
 				const emitParallelUpdate = () => {
 					const running = allResults.filter((result) => result.exitCode === -1).length;
 					const done = allResults.length - running;
 					onUpdate?.({
 						content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
-						details: makeDetails("parallel")([...allResults]),
+						details: makeDetailsFromParent("parallel")([...allResultDetails]),
 					});
 				};
 
@@ -734,13 +648,14 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate: (partial) => {
 							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
+								allResultDetails[index] = partial.details.results[0];
 								emitParallelUpdate();
 							}
 						},
 						makeDetails: makeDetails("parallel"),
 					});
 					allResults[index] = result;
+					allResultDetails[index] = toParentResult(result);
 					emitParallelUpdate();
 					return result;
 				});
@@ -884,9 +799,9 @@ export default function (pi: ExtensionAPI) {
 			const mdTheme = getMarkdownTheme();
 			const container = new Container();
 			const modeLabel = details.mode === "single" ? details.results[0]?.agent : details.mode;
-			const running = details.results.filter((entry) => entry.exitCode === -1).length;
-			const failed = details.results.filter((entry) => entry.exitCode !== -1 && isFailedResult(entry)).length;
-			const succeeded = details.results.filter((entry) => entry.exitCode !== -1 && !isFailedResult(entry)).length;
+			const running = details.results.filter((entry) => entry.status === "running").length;
+			const failed = details.results.filter((entry) => entry.status === "failed" || entry.status === "aborted").length;
+			const succeeded = details.results.filter((entry) => entry.status === "completed").length;
 			const topIcon = running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
 			const continuation = details.mode === "single" ? formatContinuedFrom(details.results[0]?.continuedFromRunId) : "";
 			const topStatus =
@@ -906,35 +821,18 @@ export default function (pi: ExtensionAPI) {
 
 			for (const entry of details.results) {
 				const icon = resultIcon(entry, theme);
-				const source = entry.agentSource !== "unknown" ? theme.fg("muted", ` (${entry.agentSource})`) : "";
-				const label = entry.step ? `Step ${entry.step}: ${entry.agent}` : entry.agent;
 				const continuedFrom = formatContinuedFrom(entry.continuedFromRunId);
-				const displayItems = getDisplayItems(entry.messages);
-				const finalOutput = getFinalOutput(entry.messages);
 
 				container.addChild(new Spacer(1));
-				container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)}${source} ${icon}${continuedFrom ? theme.fg("muted", ` (${continuedFrom})`) : ""}`, 0, 0));
-				if (expanded) {
-					container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", entry.task), 0, 0));
-				}
-
-				if (displayItems.length === 0) {
-					container.addChild(new Text(theme.fg("muted", entry.exitCode === -1 ? "(running...)" : "(no output)"), 0, 0));
-				} else if (expanded) {
-					for (const item of displayItems) {
-						if (item.type === "toolCall") {
-							container.addChild(new Text(`${theme.fg("muted", "→ ")}${formatToolCall(item.name, item.args, theme)}`, 0, 0));
-						}
-					}
-					if (finalOutput) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-					}
+				container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", entry.agent)} ${icon}${continuedFrom ? theme.fg("muted", ` (${continuedFrom})`) : ""}`, 0, 0));
+				if (entry.runId) container.addChild(new Text(theme.fg("muted", `Run: ${formatShortRunId(entry.runId)} (${entry.runId})`), 0, 0));
+				if (entry.sessionId) container.addChild(new Text(theme.fg("muted", `Session: ${entry.sessionId}`), 0, 0));
+				if (entry.finalOutput) {
+					container.addChild(new Spacer(1));
+					container.addChild(new Markdown(entry.finalOutput.trim(), 0, 0, mdTheme));
 				} else {
-					container.addChild(new Text(renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT, false, theme), 0, 0));
+					container.addChild(new Text(theme.fg("muted", entry.status === "running" ? "(running...)" : "(no output)"), 0, 0));
 				}
-
-				if (entry.errorMessage) container.addChild(new Text(theme.fg("error", `Error: ${entry.errorMessage}`), 0, 0));
 				const usage = formatUsageStats(entry.usage, entry.model);
 				if (usage) container.addChild(new Text(theme.fg("dim", usage), 0, 0));
 			}

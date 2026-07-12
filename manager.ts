@@ -3,7 +3,7 @@ import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } 
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
 import { createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
-import { getFinalOutput, getResultOutput, isFailedResult } from "./results.ts";
+import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
@@ -222,7 +222,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		packageAgentsDir: discovery.packageAgentsDir,
 		userAgentsDir: discovery.userAgentsDir,
 		projectAgentsDir: discovery.projectAgentsDir,
-		results,
+		results: results.map(toParentResult),
 	});
 	// Allocate the managed child session before calling runSingleAgent. Once its
 	// session arguments are supplied, runSingleAgent creates the run synchronously
