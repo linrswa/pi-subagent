@@ -11,6 +11,21 @@ export interface ChildSessionRef {
 	leafId?: string;
 }
 
+// Ephemeral main sessions have no durable SessionManager id. Keep one runtime
+// owner stable for this extension process rather than putting child sessions in
+// the project tree or allocating a new owner directory per run.
+const runtimeOwnerSessionId = `runtime-${randomUUID()}`;
+
+/** Use the main session id when available, otherwise a process-local owner id. */
+export function getChildSessionOwnerId(mainSessionId: string | undefined): string {
+	const candidate = mainSessionId?.trim();
+	if (candidate) {
+		assertValidChildSessionId(candidate);
+		return candidate;
+	}
+	return runtimeOwnerSessionId;
+}
+
 /** The directory which is deliberately outside the project working tree. */
 export function getChildSessionsRoot(): string {
 	return path.resolve(getAgentDir(), "subagent-sessions");

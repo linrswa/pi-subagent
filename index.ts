@@ -1,8 +1,8 @@
 /**
  * Subagent Tool - delegate tasks to specialized pi agents with isolated context.
  *
- * Each invocation spawns one or more separate `pi --mode json -p --no-session`
- * processes. This keeps child context windows isolated while streaming progress
+ * Each invocation spawns one or more separate persisted `pi --mode json -p`
+ * sessions. This keeps child context windows isolated while streaming progress
  * back into the parent tool result.
  */
 
@@ -27,6 +27,7 @@ import {
 	buildRunRefContext,
 	createRunRefAutocompleteProvider,
 	getBgAgentCompletions,
+	getMainSessionOwnerId,
 	getMode,
 	getRunRefCompletions,
 	normalizeAgentRef,
@@ -460,6 +461,7 @@ export default function (pi: ExtensionAPI) {
 				task: buildFollowUpTask(run, question, params.context),
 				cwd: params.cwd ?? run.cwd,
 				agentScope,
+				ownerSessionId: getMainSessionOwnerId(ctx),
 				signal,
 				onUpdate: onUpdate as OnUpdateCallback | undefined,
 				makeDetails,
@@ -682,6 +684,7 @@ export default function (pi: ExtensionAPI) {
 						cwd: step.cwd,
 						step: i + 1,
 						agentScope,
+						ownerSessionId: getMainSessionOwnerId(ctx),
 						signal,
 						onUpdate: chainUpdate,
 						makeDetails: makeDetails("chain"),
@@ -742,6 +745,7 @@ export default function (pi: ExtensionAPI) {
 						task: task.task,
 						cwd: task.cwd,
 						agentScope,
+						ownerSessionId: getMainSessionOwnerId(ctx),
 						signal,
 						onUpdate: (partial) => {
 							if (partial.details?.results[0]) {
@@ -781,6 +785,7 @@ export default function (pi: ExtensionAPI) {
 					task: params.task,
 					cwd: params.cwd,
 					agentScope,
+					ownerSessionId: getMainSessionOwnerId(ctx),
 					signal,
 					onUpdate: onUpdate as OnUpdateCallback | undefined,
 					makeDetails: makeDetails("single"),

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "./agents.ts";
+import { createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import type { AgentMessage, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
@@ -68,6 +69,8 @@ export interface RunSingleAgentOptions {
 	step?: number;
 	/** Child-session pointer metadata only; never child-session history. */
 	agentScope?: AgentScope;
+	/** Main-session id, or a process-local runtime owner for ephemeral parents. */
+	ownerSessionId?: string;
 	sessionId?: string;
 	sessionDir?: string;
 	sessionFile?: string;
@@ -91,8 +94,9 @@ export async function runSingleAgent({
 	cwd,
 	step,
 	agentScope,
-	sessionId,
-	sessionDir,
+	ownerSessionId,
+	sessionId: suppliedSessionId,
+	sessionDir: suppliedSessionDir,
 	sessionFile,
 	leafId,
 	continuedFromRunId,
@@ -103,6 +107,13 @@ export async function runSingleAgent({
 	onRunCreated,
 }: RunSingleAgentOptions): Promise<SingleResult> {
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
+	// Fresh child invocations always get an independent managed Pi session. The
+	// supplied-session path is reserved for the later continuation ticket.
+	const freshSession = suppliedSessionId && suppliedSessionDir
+		? undefined
+		: await createFreshChildSession(getChildSessionOwnerId(ownerSessionId));
+	const sessionId = suppliedSessionId ?? freshSession!.sessionId;
+	const sessionDir = suppliedSessionDir ?? freshSession!.sessionDir;
 	const agent = agents.find((candidate) => candidate.name === agentName);
 	const selectedModel = agent?.model ?? fallbackModel;
 	const run = subagentRunStore.create({
@@ -155,7 +166,12 @@ export async function runSingleAgent({
 		return failedResult;
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session", "--exclude-tools", "subagent,bg_agent,subagent_schedule"];
+	const args: string[] = [
+		"--mode", "json", "-p",
+		"--session-id", sessionId,
+		"--session-dir", sessionDir,
+		"--exclude-tools", "subagent,bg_agent,subagent_schedule",
+	];
 	if (selectedModel) args.push("--model", selectedModel);
 	if (!agent.model && fallbackThinkingLevel) args.push("--thinking", fallbackThinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -352,7 +368,21 @@ export async function runSingleAgent({
 		});
 
 		currentResult.exitCode = exitCode;
+
+		// Pi owns the JSONL format. Resolve its persisted checkpoint only after
+		// the child exits; no child transcript is read into this process.
+		const persisted = await findChildSession(sessionId, runCwd, sessionDir);
+		if (persisted) {
+			currentResult.sessionFile = persisted.sessionFile;
+			currentResult.leafId = persisted.leafId;
+			syncRun({ sessionFile: persisted.sessionFile, leafId: persisted.leafId });
+		}
+
 		if (wasAborted) throw new Error("Subagent was aborted");
+		if (getTerminalRunStatus(currentResult) === "completed" && (!currentResult.sessionFile || !currentResult.leafId)) {
+			currentResult.exitCode = 1;
+			currentResult.errorMessage = "Child completed without a persisted session checkpoint";
+		}
 		markTerminal(getTerminalRunStatus(currentResult));
 		return currentResult;
 	} catch (error) {

@@ -2,11 +2,24 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
+import { getChildSessionOwnerId } from "./child-sessions.ts";
 import { getResultOutput, isFailedResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import type { BgAgentParamsInput, SingleResult, StartBackgroundAgentResult, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
+
+/**
+ * Persisted parents use their Pi session id; --no-session parents share a
+ * process-local runtime owner. This is intentionally not a cwd-derived id.
+ */
+export function getMainSessionOwnerId(ctx: ExtensionContext): string {
+	try {
+		return getChildSessionOwnerId(ctx.sessionManager.getSessionId());
+	} catch {
+		return getChildSessionOwnerId(undefined);
+	}
+}
 
 function compactPreview(text: string | undefined, maxLength: number): string {
 	const normalized = (text ?? "").replace(/\s+/g, " ").trim();
@@ -159,6 +172,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		task,
 		cwd: params.cwd,
 		agentScope,
+		ownerSessionId: getMainSessionOwnerId(ctx),
 		makeDetails,
 		onRunCreated: (run) => {
 			createdRun = run;
