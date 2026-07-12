@@ -9,9 +9,9 @@ import { getChildSessionsRoot } from "../child-sessions.ts";
 import { startBackgroundAgent } from "../manager.ts";
 import { subagentRunStore } from "../store.ts";
 
-async function waitForTerminal(runId: string): Promise<void> {
+async function waitForTerminal(runId: string, ownerSessionId: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		const run = subagentRunStore.get(runId);
+		const run = subagentRunStore.get(runId, ownerSessionId);
 		if (run && ["completed", "failed", "aborted"].includes(run.status)) return;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
@@ -61,8 +61,8 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 	assert.equal(result.run.status, "queued");
 	assert.equal(result.run.sessionDir, path.join(getChildSessionsRoot(), owner));
 	assert.ok(result.run.sessionId);
-	await waitForTerminal(result.run.id);
-	const run = subagentRunStore.get(result.run.id)!;
+	await waitForTerminal(result.run.id, owner);
+	const run = subagentRunStore.get(result.run.id, owner)!;
 	assert.equal(run.status, "completed");
 	assert.ok(run.sessionFile);
 	assert.ok(run.leafId);

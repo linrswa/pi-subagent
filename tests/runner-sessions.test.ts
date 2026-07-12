@@ -109,7 +109,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 			assert.ok(result.sessionFile);
 			assert.ok(result.leafId);
 			assert.equal(result.sessionDir, path.join(getChildSessionsRoot(), owner));
-			const stored = subagentRunStore.get(result.runId!);
+			const stored = subagentRunStore.get(result.runId!, owner);
 			assert.equal(stored?.sessionFile, result.sessionFile);
 			assert.equal(stored?.leafId, result.leafId);
 			const context = SessionManager.open(result.sessionFile!).buildSessionContext();

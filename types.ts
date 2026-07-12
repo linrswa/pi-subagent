@@ -36,6 +36,8 @@ export interface AgentMessage {
 
 export interface SubagentRun {
 	id: string;
+	/** Main Pi session which owns this run's in-memory scope. */
+	ownerSessionId: string;
 	mode: SubagentMode;
 	agent: string;
 	agentSource: AgentSource | "unknown";
@@ -177,5 +179,6 @@ export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; n
 
 export type SubagentRunSubscriber = (runs: readonly SubagentRun[]) => void;
 export type CreateSubagentRunInput = Pick<SubagentRun, "mode" | "agent" | "agentSource" | "task"> &
-	Partial<Pick<SubagentRun, "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId">>;
+	/** Omitted only for legacy/runtime callers; store assigns its active runtime owner. */
+	Partial<Pick<SubagentRun, "ownerSessionId" | "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId">>;
 export type SubagentRunPatch = Partial<Omit<SubagentRun, "id">>;

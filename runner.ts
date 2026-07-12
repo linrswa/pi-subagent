@@ -112,11 +112,13 @@ export async function runSingleAgent({
 	onRunCreated,
 }: RunSingleAgentOptions): Promise<SingleResult> {
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
+	// Capture this before any await: later session switches must not redirect updates.
+	const runOwnerSessionId = getChildSessionOwnerId(ownerSessionId ?? subagentRunStore.getActiveOwner());
 	// A continuation forks before spawning: the source file is never opened by
 	// the child process, so concurrent sibling continuations cannot write it.
 	const branchedSession = continueFrom ? await branchChildSession(continueFrom) : undefined;
 	const freshSession = !branchedSession && !(suppliedSessionId && suppliedSessionDir)
-		? await createFreshChildSession(getChildSessionOwnerId(ownerSessionId))
+		? await createFreshChildSession(runOwnerSessionId)
 		: undefined;
 	const sessionId = branchedSession?.sessionId ?? suppliedSessionId ?? freshSession!.sessionId;
 	const sessionDir = branchedSession?.sessionDir ?? suppliedSessionDir ?? freshSession!.sessionDir;
@@ -128,6 +130,7 @@ export async function runSingleAgent({
 	const selectedModel = agent?.model ?? fallbackModel;
 	const run = subagentRunStore.create({
 		mode,
+		ownerSessionId: runOwnerSessionId,
 		agent: agentName,
 		agentSource: agent?.source ?? "unknown",
 		task,
@@ -172,7 +175,7 @@ export async function runSingleAgent({
 			errorMessage,
 			messages: failedResult.messages,
 			usage: failedResult.usage,
-		});
+		}, runOwnerSessionId);
 		return failedResult;
 	}
 
@@ -223,7 +226,7 @@ export async function runSingleAgent({
 			finalOutput: finalOutput || undefined,
 			errorMessage: currentResult.errorMessage || undefined,
 			...patch,
-		});
+		}, runOwnerSessionId);
 	};
 
 	const emitUpdate = (patch: SubagentRunPatch = {}) => {

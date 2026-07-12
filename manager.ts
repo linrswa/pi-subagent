@@ -189,6 +189,8 @@ export async function confirmProjectAgentIfNeeded(
 }
 
 export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {
+	// Capture before confirmation/session allocation; this promise may outlive a session switch.
+	const ownerSessionId = getMainSessionOwnerId(ctx);
 	const task = params.prompt?.trim();
 	if (!task) return { ok: false, message: "bg_agent requires prompt." };
 
@@ -227,7 +229,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 	// (before its next await), which is required by the background API.
 	let freshSession: Awaited<ReturnType<typeof createFreshChildSession>>;
 	try {
-		freshSession = await createFreshChildSession(getMainSessionOwnerId(ctx));
+		freshSession = await createFreshChildSession(ownerSessionId);
 	} catch (error) {
 		return { ok: false, message: `Failed to allocate child session: ${error instanceof Error ? error.message : String(error)}` };
 	}
@@ -243,7 +245,7 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		task,
 		cwd: params.cwd,
 		agentScope,
-		ownerSessionId: getMainSessionOwnerId(ctx),
+		ownerSessionId,
 		sessionId: freshSession.sessionId,
 		sessionDir: freshSession.sessionDir,
 		makeDetails,

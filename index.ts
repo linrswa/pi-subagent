@@ -43,7 +43,7 @@ import {
 	formatScheduleId,
 	formatScheduleList,
 } from "./scheduler.ts";
-import { makeEmptyUsage } from "./store.ts";
+import { makeEmptyUsage, subagentRunStore } from "./store.ts";
 import { SubagentSettingsComponent } from "./settings-ui.ts";
 import { openSubagentRunViewer } from "./viewer.ts";
 import {
@@ -294,6 +294,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionCwd = ctx.cwd;
+		subagentRunStore.setActiveOwner(getMainSessionOwnerId(ctx));
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
@@ -315,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const run = subagentManager.findRun(args.trim());
 			if (!run) return ctx.ui.notify(`Unknown subagent run: ${args.trim() || "(missing)"}`, "warning");
-			openSubagentRunViewer(ctx, run.id);
+			openSubagentRunViewer(ctx, run.id, run.ownerSessionId);
 		},
 	});
 

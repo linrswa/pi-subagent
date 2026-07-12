@@ -121,14 +121,15 @@ class SubagentRunViewerComponent implements Component {
 		private readonly tui: TUI,
 		private readonly theme: RunViewerTheme,
 		private readonly runId: string,
+		private readonly ownerSessionId: string,
 		private readonly done: () => void,
 		private readonly stopRun: (runId: string) => void,
 	) {
 		this.unsubscribe = subagentRunStore.subscribe((runs) => {
-			this.run = runs.find((candidate) => candidate.id === runId);
+			this.run = runs.find((candidate) => candidate.id === runId && candidate.ownerSessionId === ownerSessionId);
 			this.followTail ||= this.scrollTop >= this.maxScroll();
 			this.tui.requestRender();
-		});
+		}, ownerSessionId);
 	}
 
 	handleInput(data: string): void {
@@ -271,17 +272,17 @@ class SubagentRunViewerComponent implements Component {
 	}
 }
 
-export function openSubagentRunViewer(ctx: ExtensionContext, runId: string): void {
+export function openSubagentRunViewer(ctx: ExtensionContext, runId: string, ownerSessionId = subagentRunStore.getActiveOwner()): void {
 	if (ctx.mode !== "tui") {
-		const run = findRunByRef(runId);
+		const run = findRunByRef(runId, subagentRunStore.getSnapshot(ownerSessionId));
 		ctx.ui.notify(run ? formatRunList([run]) : `Unknown subagent run: ${runId}`, run ? "info" : "warning");
 		return;
 	}
 	void ctx.ui
 		.custom<void>(
 			(tui, theme, _keybindings, done) =>
-				new SubagentRunViewerComponent(tui, theme, runId, done, (targetRunId) => {
-					if (!subagentRunStore.abort(targetRunId)) ctx.ui.notify(`${formatShortRunId(targetRunId)} is not running.`, "warning");
+				new SubagentRunViewerComponent(tui, theme, runId, ownerSessionId, done, (targetRunId) => {
+					if (!subagentRunStore.abort(targetRunId, ownerSessionId)) ctx.ui.notify(`${formatShortRunId(targetRunId)} is not running.`, "warning");
 				}),
 			{ overlay: true, overlayOptions: SUBAGENT_VIEWER_OVERLAY_OPTIONS },
 		)

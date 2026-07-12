@@ -1,3 +1,4 @@
+import { getChildSessionOwnerId } from "./child-sessions.ts";
 import type { CreateSubagentRunInput, SubagentRun, SubagentRunPatch, SubagentRunSubscriber, UsageStats } from "./types.ts";
 
 export function makeEmptyUsage(): UsageStats {
@@ -5,99 +6,91 @@ export function makeEmptyUsage(): UsageStats {
 }
 
 export function cloneUsageStats(usage: UsageStats): UsageStats {
-	return {
-		input: usage.input,
-		output: usage.output,
-		cacheRead: usage.cacheRead,
-		cacheWrite: usage.cacheWrite,
-		cost: usage.cost,
-		contextTokens: usage.contextTokens,
-		turns: usage.turns,
-	};
+	return { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, cost: usage.cost, contextTokens: usage.contextTokens, turns: usage.turns };
 }
 
+/** In-memory runs, partitioned by the owning main Pi session. */
 export class SubagentRunStore {
-	private nextRunNumber = 1;
+	private activeOwnerSessionId = getChildSessionOwnerId(undefined);
+	private readonly nextRunNumbers = new Map<string, number>();
 	private readonly runs = new Map<string, SubagentRun>();
-	private readonly subscribers = new Set<SubagentRunSubscriber>();
+	private readonly subscribers = new Map<SubagentRunSubscriber, string>();
+
+	setActiveOwner(ownerSessionId: string): void {
+		this.activeOwnerSessionId = ownerSessionId;
+		this.notify();
+	}
+
+	getActiveOwner(): string {
+		return this.activeOwnerSessionId;
+	}
 
 	create(input: CreateSubagentRunInput): SubagentRun {
+		const ownerSessionId = input.ownerSessionId ?? this.activeOwnerSessionId;
+		const number = this.nextRunNumbers.get(ownerSessionId) ?? 1;
+		this.nextRunNumbers.set(ownerSessionId, number + 1);
 		const run: SubagentRun = {
-			id: `subagent-${this.nextRunNumber++}`,
+			id: `subagent-${number}`,
 			status: "queued",
 			startedAt: Date.now(),
 			messages: [],
 			usage: makeEmptyUsage(),
 			...input,
+			ownerSessionId,
 		};
-		this.runs.set(run.id, this.cloneRun(run));
+		this.runs.set(this.key(ownerSessionId, run.id), this.cloneRun(run));
 		this.notify();
 		return this.cloneRun(run);
 	}
 
-	update(id: string, patch: SubagentRunPatch): SubagentRun | undefined {
-		const existing = this.runs.get(id);
+	/** ownerSessionId is captured by runners so async completions never follow a later active scope. */
+	update(id: string, patch: SubagentRunPatch, ownerSessionId = this.activeOwnerSessionId): SubagentRun | undefined {
+		const key = this.key(ownerSessionId, id);
+		const existing = this.runs.get(key);
 		if (!existing) return undefined;
-
-		const next: SubagentRun = {
-			...existing,
-			...patch,
-			messages: patch.messages ? [...patch.messages] : existing.messages,
-			usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage,
-		};
-		this.runs.set(id, next);
+		const next: SubagentRun = { ...existing, ...patch, ownerSessionId: existing.ownerSessionId, messages: patch.messages ? [...patch.messages] : existing.messages, usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage };
+		this.runs.set(key, next);
 		this.notify();
 		return this.cloneRun(next);
 	}
 
-	get(id: string): SubagentRun | undefined {
-		const run = this.runs.get(id);
+	get(id: string, ownerSessionId = this.activeOwnerSessionId): SubagentRun | undefined {
+		const run = this.runs.get(this.key(ownerSessionId, id));
 		return run ? this.cloneRun(run) : undefined;
 	}
 
-	getSnapshot(): SubagentRun[] {
-		return Array.from(this.runs.values(), (run) => this.cloneRun(run));
+	getSnapshot(ownerSessionId = this.activeOwnerSessionId): SubagentRun[] {
+		return Array.from(this.runs.values()).filter((run) => run.ownerSessionId === ownerSessionId).map((run) => this.cloneRun(run));
 	}
 
-	subscribe(subscriber: SubagentRunSubscriber): () => void {
-		this.subscribers.add(subscriber);
-		subscriber(this.getSnapshot());
+	subscribe(subscriber: SubagentRunSubscriber, ownerSessionId = this.activeOwnerSessionId): () => void {
+		this.subscribers.set(subscriber, ownerSessionId);
+		subscriber(this.getSnapshot(ownerSessionId));
 		return () => this.subscribers.delete(subscriber);
 	}
 
-	abort(id: string): boolean {
-		const run = this.runs.get(id);
+	abort(id: string, ownerSessionId = this.activeOwnerSessionId): boolean {
+		const run = this.runs.get(this.key(ownerSessionId, id));
 		if (!run?.abort) return false;
 		run.abort();
 		return true;
 	}
 
-	remove(id: string): boolean {
-		const run = this.runs.get(id);
+	remove(id: string, ownerSessionId = this.activeOwnerSessionId): boolean {
+		const key = this.key(ownerSessionId, id);
+		const run = this.runs.get(key);
 		if (!run) return false;
 		run.abort?.();
-		const deleted = this.runs.delete(id);
+		const deleted = this.runs.delete(key);
 		if (deleted) this.notify();
 		return deleted;
 	}
 
-	private cloneRun(run: SubagentRun): SubagentRun {
-		return {
-			...run,
-			messages: [...run.messages],
-			usage: cloneUsageStats(run.usage),
-		};
-	}
-
+	private key(ownerSessionId: string, id: string): string { return `${ownerSessionId}\u0000${id}`; }
+	private cloneRun(run: SubagentRun): SubagentRun { return { ...run, messages: [...run.messages], usage: cloneUsageStats(run.usage) }; }
 	private notify(): void {
-		if (this.subscribers.size === 0) return;
-		const snapshot = this.getSnapshot();
-		for (const subscriber of this.subscribers) {
-			try {
-				subscriber(snapshot);
-			} catch {
-				// Keep store updates isolated from subscriber failures.
-			}
+		for (const [subscriber, ownerSessionId] of this.subscribers) {
+			try { subscriber(this.getSnapshot(ownerSessionId)); } catch { /* isolate subscribers */ }
 		}
 	}
 }
