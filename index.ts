@@ -546,6 +546,11 @@ export default function (pi: ExtensionAPI) {
 			if (mode && sourceRun && !["completed", "failed", "aborted"].includes(sourceRun.status)) {
 				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run is still ${sourceRun.status}.` }], details: { mode: "single", results: [] } };
 			}
+			// abort() marks a run aborted before the child exits and its final
+			// session checkpoint is resolved. Do not fork that still-live source.
+			if (mode && sourceRun && (sourceRun.endedAt === undefined || sourceRun.abort)) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run has not fully closed; wait for it to stop.` }], details: { mode: "single", results: [] } };
+			}
 			if (mode && sourceRun && !sourceRun.sessionFile) {
 				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run has no persisted session.` }], details: { mode: "single", results: [] } };
 			}
@@ -594,6 +599,19 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: makeDetails("single")([]),
 				};
+			}
+
+			// Resolve a continuation's inherited or overridden agent before
+			// branchChildSession() can create a child-session file or run record.
+			if (sourceRun) {
+				const selectedAgentName = params.agent ?? sourceRun.agent;
+				if (!agents.some((agent) => agent.name === selectedAgentName)) {
+					const list = formatAgentList(agents);
+					return {
+						content: [{ type: "text", text: `Unknown agent: "${selectedAgentName}". Available agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}` }],
+						details: makeDetails("single")([]),
+					};
+				}
 			}
 
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
