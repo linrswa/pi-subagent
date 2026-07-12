@@ -4,10 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "./agents.ts";
-import { createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { branchChildSession, createFreshChildSession, findChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getFinalOutput, getLastToolCallName, getTerminalRunStatus } from "./results.ts";
 import { makeEmptyUsage, subagentRunStore } from "./store.ts";
-import type { AgentMessage, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
+import type { AgentMessage, ContinuationSource, OnUpdateCallback, RunStatus, SingleResult, SubagentDetails, SubagentMode, SubagentRun, SubagentRunPatch } from "./types.ts";
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
@@ -75,7 +75,11 @@ export interface RunSingleAgentOptions {
 	sessionDir?: string;
 	sessionFile?: string;
 	leafId?: string;
+	/** Fork this completed child-session checkpoint instead of starting fresh. */
+	continueFrom?: ContinuationSource;
+	/** @deprecated Internal metadata retained for existing callers. Use continueFrom. */
 	continuedFromRunId?: string;
+	/** @deprecated Internal metadata retained for existing callers. Use continueFrom. */
 	continuedFromLeafId?: string;
 	signal?: AbortSignal;
 	onUpdate?: OnUpdateCallback;
@@ -97,23 +101,29 @@ export async function runSingleAgent({
 	ownerSessionId,
 	sessionId: suppliedSessionId,
 	sessionDir: suppliedSessionDir,
-	sessionFile,
-	leafId,
-	continuedFromRunId,
-	continuedFromLeafId,
+	sessionFile: suppliedSessionFile,
+	leafId: suppliedLeafId,
+	continueFrom,
+	continuedFromRunId: suppliedContinuedFromRunId,
+	continuedFromLeafId: suppliedContinuedFromLeafId,
 	signal,
 	onUpdate,
 	makeDetails,
 	onRunCreated,
 }: RunSingleAgentOptions): Promise<SingleResult> {
 	const runCwd = resolveChildCwd(defaultCwd, cwd);
-	// Fresh child invocations always get an independent managed Pi session. The
-	// supplied-session path is reserved for the later continuation ticket.
-	const freshSession = suppliedSessionId && suppliedSessionDir
-		? undefined
-		: await createFreshChildSession(getChildSessionOwnerId(ownerSessionId));
-	const sessionId = suppliedSessionId ?? freshSession!.sessionId;
-	const sessionDir = suppliedSessionDir ?? freshSession!.sessionDir;
+	// A continuation forks before spawning: the source file is never opened by
+	// the child process, so concurrent sibling continuations cannot write it.
+	const branchedSession = continueFrom ? await branchChildSession(continueFrom) : undefined;
+	const freshSession = !branchedSession && !(suppliedSessionId && suppliedSessionDir)
+		? await createFreshChildSession(getChildSessionOwnerId(ownerSessionId))
+		: undefined;
+	const sessionId = branchedSession?.sessionId ?? suppliedSessionId ?? freshSession!.sessionId;
+	const sessionDir = branchedSession?.sessionDir ?? suppliedSessionDir ?? freshSession!.sessionDir;
+	const sessionFile = branchedSession?.sessionFile ?? suppliedSessionFile;
+	const leafId = branchedSession?.leafId ?? suppliedLeafId;
+	const continuedFromRunId = continueFrom?.runId ?? suppliedContinuedFromRunId;
+	const continuedFromLeafId = continueFrom?.leafId ?? suppliedContinuedFromLeafId;
 	const agent = agents.find((candidate) => candidate.name === agentName);
 	const selectedModel = agent?.model ?? fallbackModel;
 	const run = subagentRunStore.create({
@@ -166,12 +176,13 @@ export async function runSingleAgent({
 		return failedResult;
 	}
 
-	const args: string[] = [
-		"--mode", "json", "-p",
-		"--session-id", sessionId,
-		"--session-dir", sessionDir,
-		"--exclude-tools", "subagent,bg_agent,subagent_schedule",
-	];
+	const args: string[] = ["--mode", "json", "-p"];
+	if (branchedSession?.sessionFile) {
+		args.push("--session", branchedSession.sessionFile);
+	} else {
+		args.push("--session-id", sessionId, "--session-dir", sessionDir);
+	}
+	args.push("--exclude-tools", "subagent,bg_agent,subagent_schedule");
 	if (selectedModel) args.push("--model", selectedModel);
 	if (!agent.model && fallbackThinkingLevel) args.push("--thinking", fallbackThinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -242,7 +253,9 @@ export async function runSingleAgent({
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
+		// A branched Pi session already supplies conversation context. Its prompt
+		// must be only the newly requested task, never reconstructed history.
+		args.push(branchedSession ? task : `Task: ${task}`);
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);

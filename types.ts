@@ -63,6 +63,13 @@ export interface SubagentRun {
 	abort?: () => void;
 }
 
+/** The completed child-session checkpoint from which a runner continuation forks. */
+export interface ContinuationSource {
+	runId: string;
+	sessionFile: string;
+	leafId: string;
+}
+
 export interface SingleResult {
 	runId?: string;
 	agent: string;
