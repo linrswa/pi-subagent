@@ -21,8 +21,9 @@ const ChainItemSchema = {
 export const SubagentParamsSchema = {
 	type: "object",
 	properties: {
-		agent: { type: "string", description: "Name of the agent to invoke (for single mode)" },
-		task: { type: "string", description: "Task to delegate (for single mode)" },
+		agent: { type: "string", description: "Name of the agent to invoke (for single mode or continuation override)" },
+		continueFrom: { type: "string", description: "Completed run to continue: subagent-3, &3, or 3. Requires task and supports single mode only." },
+		task: { type: "string", description: "Task to delegate (required for single mode and continuation)" },
 		tasks: {
 			type: "array",
 			description: "Array of {agent, task} for parallel execution",

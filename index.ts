@@ -7,6 +7,7 @@
  */
 
 import * as os from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
@@ -580,24 +581,46 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context windows.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Modes: single (agent + task), continuation (continueFrom + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (bundled agents + ~/.pi/agent/agents).',
 			'To enable repo-local .pi/agents, set agentScope: "both" or "project".',
 		].join(" "),
-		promptSnippet: "Delegate focused work to specialized subagents with isolated context; supports single, parallel, and chained tasks.",
+		promptSnippet: "Delegate focused work to specialized subagents with isolated context; supports single, continuation from a completed run, parallel, and chained tasks.",
 		promptGuidelines: [
 			"Use subagent for focused codebase reconnaissance, implementation planning, or independent code review when isolation helps.",
 			"Use subagent parallel mode for read-only research/review tasks; avoid parallel subagents that edit the same files.",
 			"Use subagent chain mode with {previous} to pass explorer findings to planner or reviewer output to worker.",
+			"Continue a completed run with {continueFrom: \"&1\", task: \"...\"}; omit agent to reuse it, or provide agent to switch. Continuations retain the source cwd.",
 		],
 		parameters: SubagentParamsSchema as never,
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			const params = rawParams as SubagentParamsInput;
-			const agentScope: AgentScope = params.agentScope ?? "user";
+			const mode = getMode(params);
+			const sourceRun = params.continueFrom ? subagentManager.findRun(params.continueFrom) : undefined;
+
+			if (mode && params.continueFrom && !sourceRun) {
+				return { content: [{ type: "text", text: `Unknown subagent run to continue: ${params.continueFrom}` }], details: { mode: "single", results: [] } };
+			}
+			if (mode && sourceRun && !["completed", "failed", "aborted"].includes(sourceRun.status)) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run is still ${sourceRun.status}.` }], details: { mode: "single", results: [] } };
+			}
+			if (mode && sourceRun && !sourceRun.sessionFile) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run has no persisted session.` }], details: { mode: "single", results: [] } };
+			}
+			if (mode && sourceRun && !sourceRun.leafId) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source session leaf is missing.` }], details: { mode: "single", results: [] } };
+			}
+			if (mode && sourceRun && !sourceRun.cwd) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: source run has no working directory.` }], details: { mode: "single", results: [] } };
+			}
+			if (mode && sourceRun && params.cwd && path.resolve(ctx.cwd, params.cwd) !== sourceRun.cwd) {
+				return { content: [{ type: "text", text: `Cannot continue ${formatShortRunId(sourceRun.id)}: continuation cwd must match source cwd (${sourceRun.cwd}).` }], details: { mode: "single", results: [] } };
+			}
+
+			const agentScope: AgentScope = params.agentScope ?? sourceRun?.agentScope ?? (sourceRun?.agentSource === "project" ? "both" : "user");
 			const discovery = discoverAgentsWithSettings(ctx.cwd, agentScope, ctx.isProjectTrusted());
 			const agents = discovery.agents;
-			const mode = getMode(params);
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -625,7 +648,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode: {agent, task}, {tasks}, or {chain}.\n\nAvailable agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`,
+							text: `Invalid parameters. Provide exactly one mode: {agent, task}, {continueFrom, task}, {tasks}, or {chain}.\n\nAvailable agents:\n${list.text}${list.remaining ? `\n... and ${list.remaining} more` : ""}`,
 						},
 					],
 					details: makeDetails("single")([]),
@@ -637,6 +660,7 @@ export default function (pi: ExtensionAPI) {
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const task of params.tasks) requestedAgentNames.add(task.agent);
 				if (params.agent) requestedAgentNames.add(params.agent);
+				else if (sourceRun) requestedAgentNames.add(sourceRun.agent);
 
 				const projectAgentsRequested = Array.from(requestedAgentNames)
 					.map((name) => agents.find((agent) => agent.name === name))
@@ -774,27 +798,33 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (mode === "single" && params.agent && params.task) {
-				const result = await runSingleAgent({
-					mode: "single",
-					defaultCwd: ctx.cwd,
-					agents,
-					agentName: params.agent,
-					fallbackModel,
-					fallbackThinkingLevel,
-					task: params.task,
-					cwd: params.cwd,
-					agentScope,
-					ownerSessionId: getMainSessionOwnerId(ctx),
-					signal,
-					onUpdate: onUpdate as OnUpdateCallback | undefined,
-					makeDetails: makeDetails("single"),
-				});
+			if (mode === "single" && params.task && (params.agent || sourceRun)) {
+				try {
+					const result = await runSingleAgent({
+						mode: "single",
+						defaultCwd: ctx.cwd,
+						agents,
+						agentName: params.agent ?? sourceRun!.agent,
+						fallbackModel,
+						fallbackThinkingLevel,
+						task: params.task,
+						cwd: sourceRun?.cwd ?? params.cwd,
+						agentScope,
+						ownerSessionId: getMainSessionOwnerId(ctx),
+						continueFrom: sourceRun ? { runId: sourceRun.id, sessionFile: sourceRun.sessionFile!, leafId: sourceRun.leafId! } : undefined,
+						signal,
+						onUpdate: onUpdate as OnUpdateCallback | undefined,
+						makeDetails: makeDetails("single"),
+					});
 
-				return {
-					content: [{ type: "text", text: isFailedResult(result) ? `Agent failed: ${getResultOutput(result)}` : getResultOutput(result) }],
-					details: makeDetails("single")([result]),
-				};
+					return {
+						content: [{ type: "text", text: isFailedResult(result) ? `Agent failed: ${getResultOutput(result)}` : getResultOutput(result) }],
+						details: makeDetails("single")([result]),
+					};
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return { content: [{ type: "text", text: `Cannot continue ${sourceRun ? formatShortRunId(sourceRun.id) : "subagent"}: ${message}` }], details: makeDetails("single")([]) };
+				}
 			}
 
 			const list = formatAgentList(agents);

@@ -28,9 +28,14 @@ function compactPreview(text: string | undefined, maxLength: number): string {
 }
 
 export function getMode(params: SubagentParamsInput): SubagentMode | undefined {
+	// Continuations cannot be embedded in parallel/chain calls, including an
+	// explicitly supplied empty collection.
+	if (params.continueFrom && (params.tasks !== undefined || params.chain !== undefined)) return undefined;
 	const hasChain = (params.chain?.length ?? 0) > 0;
 	const hasTasks = (params.tasks?.length ?? 0) > 0;
-	const hasSingle = Boolean(params.agent && params.task);
+	// A continuation supplies its agent from the source run when none is named.
+	// It is deliberately a single-mode operation: no tasks/chain may accompany it.
+	const hasSingle = Boolean(params.task && (params.agent || params.continueFrom));
 	const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 	if (modeCount !== 1) return undefined;
 	if (hasChain) return "chain";

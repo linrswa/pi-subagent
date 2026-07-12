@@ -117,6 +117,8 @@ export type TaskItem = {
 
 export type SubagentParamsInput = {
 	agent?: string;
+	/** Completed source run reference: subagent-3, &3, or 3. */
+	continueFrom?: string;
 	task?: string;
 	tasks?: TaskItem[];
 	chain?: TaskItem[];
