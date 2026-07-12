@@ -336,8 +336,11 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: stopped ? `Stopping ${formatShortRunId(run.id)}.` : `${formatShortRunId(run.id)} is not running.` }], details: { action, runId: run.id } };
 			}
 
-			subagentManager.deleteRun(run.id);
-			return { content: [{ type: "text", text: `Deleted ${formatShortRunId(run.id)}.` }], details: { action, runId: run.id } };
+			const deletion = await subagentManager.deleteRun(run.id);
+			return {
+				content: [{ type: "text", text: deletion.deleted ? `Deleted ${formatShortRunId(run.id)}.` : `Could not delete ${formatShortRunId(run.id)}: ${deletion.message ?? "unknown error"}` }],
+				details: { action, runId: run.id, deleted: deletion.deleted },
+			};
 		},
 
 		renderCall(args: SubagentControlParamsInput, theme) {

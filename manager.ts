@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
-import { createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { cleanupChildSession, createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
@@ -270,6 +270,11 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 	return { ok: true, run: createdRun, agentScope };
 }
 
+export interface DeleteRunResult {
+	deleted: boolean;
+	message?: string;
+}
+
 export class SubagentManager {
 	private readonly pi: ExtensionAPI;
 	private readonly onRunDeleted?: (run: SubagentRun) => void;
@@ -291,12 +296,56 @@ export class SubagentManager {
 		return subagentRunStore.abort(runId);
 	}
 
-	deleteRun(runId: string): boolean {
-		const run = subagentRunStore.get(runId);
-		if (!run) return false;
-		const deleted = subagentRunStore.remove(runId, run.ownerSessionId);
-		if (deleted) this.onRunDeleted?.(run);
-		return deleted;
+	/**
+	 * Stop a live process before unlinking its persisted session. Do not remove
+	 * the run or write its tombstone until all cleanup checks succeed, so a
+	 * retry remains possible after a filesystem or safety-check failure.
+	 */
+	async deleteRun(runId: string): Promise<DeleteRunResult> {
+		const initialRun = subagentRunStore.get(runId);
+		if (!initialRun) return { deleted: false, message: "Unknown subagent run." };
+
+		const stopped = await this.stopForDeletion(initialRun.id, initialRun.ownerSessionId);
+		if ("message" in stopped) return { deleted: false, message: stopped.message };
+		// Completion can discover sessionFile/leafId while an abort is in flight.
+		// Read the settled record so that file is retained neither accidentally nor
+		// by deleting a stale pre-abort descriptor.
+		const run = subagentRunStore.get(initialRun.id, initialRun.ownerSessionId);
+		if (!run) return { deleted: false, message: "Run disappeared while stopping it for deletion." };
+
+		if (run.sessionFile) {
+			const sharedFile = subagentRunStore.getSnapshot(run.ownerSessionId).some((other) =>
+				other.id !== run.id && other.sessionFile === run.sessionFile,
+			);
+			if (sharedFile) {
+				return { deleted: false, message: "Refusing to delete a child session file referenced by another run." };
+			}
+			if (!run.sessionId) {
+				return { deleted: false, message: "Refusing to delete a child session file without its session id." };
+			}
+			try {
+				await cleanupChildSession(run.sessionFile, run.sessionId);
+			} catch (error) {
+				return { deleted: false, message: `Failed to clean up child session: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+
+		const deleted = subagentRunStore.remove(run.id, run.ownerSessionId);
+		if (!deleted) return { deleted: false, message: "Run disappeared before deletion could complete." };
+		this.onRunDeleted?.(run);
+		return { deleted: true };
+	}
+
+	private async stopForDeletion(runId: string, ownerSessionId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+		const deadline = Date.now() + 7_000;
+		while (Date.now() < deadline) {
+			const run = subagentRunStore.get(runId, ownerSessionId);
+			if (!run) return { ok: false, message: "Run disappeared while stopping it for deletion." };
+			if (run.endedAt !== undefined) return { ok: true };
+			if (run.abort) run.abort();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		return { ok: false, message: "Timed out waiting for the running subagent to stop; its session was not deleted." };
 	}
 
 	startBackground(ctx: ExtensionContext, params: BgAgentParamsInput): Promise<StartBackgroundAgentResult> {

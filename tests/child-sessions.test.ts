@@ -185,3 +185,14 @@ test("cleanup refuses files outside the managed child-session directory", async 
 		await rm(outside, { force: true });
 	}
 });
+
+test("cleanup verifies the file belongs to the run session before removing it", async () => {
+	const owner = ownerId();
+	try {
+		const source = await makePersistedSession(owner);
+		await assert.rejects(cleanupChildSession(source.sessionFile, randomUUID()), /does not belong to session/);
+		assert.equal(typeof await readFile(source.sessionFile, "utf8"), "string");
+	} finally {
+		await rm(path.join(getChildSessionsRoot(), owner), { recursive: true, force: true });
+	}
+});

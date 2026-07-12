@@ -214,8 +214,25 @@ export async function branchChildSession(source: Required<Pick<ChildSessionRef, 
 	};
 }
 
-/** Delete one managed child-session file, never an arbitrary user-supplied path. */
-export async function cleanupChildSession(sessionFile: string): Promise<void> {
+/**
+ * Delete one managed child-session file, never an arbitrary user-supplied path.
+ * When an id is supplied, verify the persisted file belongs to that exact child
+ * session before unlinking it. This prevents a stale pointer from deleting a
+ * different run's file in the shared owner directory.
+ */
+export async function cleanupChildSession(sessionFile: string, expectedSessionId?: string): Promise<void> {
 	const managedFile = await assertManagedChildSessionPath(sessionFile);
+	if (expectedSessionId) {
+		assertValidChildSessionId(expectedSessionId);
+		try {
+			const actualSessionId = SessionManager.open(managedFile, path.dirname(managedFile)).getSessionId();
+			if (actualSessionId !== expectedSessionId) {
+				throw new Error(`Child session file does not belong to session ${expectedSessionId}`);
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("Child session file does not belong")) throw error;
+			throw new Error(`Unable to verify child session file before cleanup: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
 	await fs.rm(managedFile, { force: true });
 }
