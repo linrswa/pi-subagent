@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -37,6 +37,19 @@ async function makePersistedSession(ownerSessionId: string) {
 
 function ownerId(): string {
 	return `subagent-test-${randomUUID()}`;
+}
+
+async function withIsolatedAgentDir(action: (agentDir: string) => Promise<void>): Promise<void> {
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		await action(agentDir);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		await rm(agentDir, { recursive: true, force: true });
+	}
 }
 
 test("fresh child sessions are uniquely identified under the agent directory", async () => {
@@ -132,6 +145,34 @@ test("managed owner symlinks cannot escape the child-session root", async () => 
 		await assert.rejects(ensureChildSessionDir(owner), /resolves outside the managed directory/);
 	} finally {
 		await rm(managedLink, { recursive: true, force: true });
+		await rm(outside, { recursive: true, force: true });
+	}
+});
+
+test("a child-session root symlink outside the agent directory cannot be used for creation", async () => {
+	const outside = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-root-escape-"));
+	try {
+		await withIsolatedAgentDir(async (agentDir) => {
+			await symlink(outside, path.join(agentDir, "subagent-sessions"), "dir");
+			await assert.rejects(ensureChildSessionDir(ownerId()), /root resolves outside the managed directory/);
+		});
+	} finally {
+		await rm(outside, { recursive: true, force: true });
+	}
+});
+
+test("cleanup refuses a file reached through a child-session root symlink", async () => {
+	const outside = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-root-cleanup-"));
+	const outsideFile = path.join(outside, "must-survive.jsonl");
+	try {
+		await writeFile(outsideFile, "must survive");
+		await withIsolatedAgentDir(async (agentDir) => {
+			const root = path.join(agentDir, "subagent-sessions");
+			await symlink(outside, root, "dir");
+			await assert.rejects(cleanupChildSession(path.join(root, "must-survive.jsonl")), /root resolves outside the managed directory/);
+		});
+		assert.equal(await readFile(outsideFile, "utf8"), "must survive");
+	} finally {
 		await rm(outside, { recursive: true, force: true });
 	}
 });

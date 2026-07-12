@@ -64,6 +64,27 @@ async function realExistingAncestor(candidate: string): Promise<string | undefin
 }
 
 /**
+ * Verify that the root resolves to the extension-owned directory below the
+ * canonical agent directory. In particular, do not trust a symlink placed at
+ * `<getAgentDir()>/subagent-sessions` to define a new managed root.
+ */
+async function getVerifiedCanonicalChildSessionsRoot(lexicalRoot: string): Promise<string> {
+	const canonicalRoot = await fs.realpath(lexicalRoot).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	const canonicalAgentDir = await fs.realpath(getAgentDir()).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	const expectedRoot = canonicalAgentDir && path.join(canonicalAgentDir, "subagent-sessions");
+	if (canonicalRoot && canonicalRoot !== expectedRoot) {
+		throw new Error(`Child session root resolves outside the managed directory: ${lexicalRoot}`);
+	}
+	return canonicalRoot ?? expectedRoot ?? lexicalRoot;
+}
+
+/**
  * Creates the per-main-session directory used for child Pi sessions.
  * ownerSessionId is also used as a directory name, so require Pi's session-id
  * syntax instead of accepting a path fragment.
@@ -77,7 +98,7 @@ export async function ensureChildSessionDir(ownerSessionId: string): Promise<str
 	}
 
 	await fs.mkdir(root, { recursive: true });
-	const canonicalRoot = await fs.realpath(root);
+	const canonicalRoot = await getVerifiedCanonicalChildSessionsRoot(root);
 	await fs.mkdir(sessionDir, { recursive: true });
 	const canonicalSessionDir = await fs.realpath(sessionDir);
 	if (!isWithin(canonicalRoot, canonicalSessionDir)) {
@@ -101,7 +122,7 @@ export async function assertManagedChildSessionPath(sessionFile: string): Promis
 		throw new Error(`Child session path is outside the managed directory: ${sessionFile}`);
 	}
 
-	const canonicalRoot = await fs.realpath(lexicalRoot).catch(() => lexicalRoot);
+	const canonicalRoot = await getVerifiedCanonicalChildSessionsRoot(lexicalRoot);
 	// Check an existing ancestor too: a new file below a symlinked owner
 	// directory must not be treated as safe merely because the file is absent.
 	const canonicalAncestor = await realExistingAncestor(resolvedFile);
@@ -139,7 +160,7 @@ async function assertManagedChildSessionDir(sessionDir: string): Promise<void> {
 		throw new Error(`Child session directory is outside the managed directory: ${sessionDir}`);
 	}
 
-	const canonicalRoot = await fs.realpath(lexicalRoot).catch(() => lexicalRoot);
+	const canonicalRoot = await getVerifiedCanonicalChildSessionsRoot(lexicalRoot);
 	const canonicalDir = await realExistingAncestor(resolvedDir);
 	if (!canonicalDir || !isWithin(canonicalRoot, canonicalDir)) {
 		throw new Error(`Child session directory resolves outside the managed directory: ${sessionDir}`);
