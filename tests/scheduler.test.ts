@@ -37,3 +37,47 @@ test("generated schedule ids still display short", () => {
 	assert.equal(formatScheduleId("schedule-mabc1234-zzzz"), "mabc1234-zzzz");
 	assert.equal(formatScheduleId("schedule-daily-tests"), "schedule-daily-tests");
 });
+
+test("legacy schedule fields are discarded when schedules are saved", async (t) => {
+	const cwd = await tempDir();
+	const controller = new SubagentSchedulerController();
+	t.after(async () => {
+		controller.stop();
+		await fs.rm(cwd, { recursive: true, force: true });
+	});
+
+	const storageDir = path.join(cwd, ".pi", "subagent-schedules");
+	const obsoleteKey = ["pony", "tailMode"].join("");
+	await fs.mkdir(storageDir, { recursive: true });
+	await fs.writeFile(
+		path.join(storageDir, "test-session.json"),
+		JSON.stringify({
+			version: 1,
+			jobs: [
+				{
+					id: "legacy",
+					schedule: "1h",
+					kind: "interval",
+					prompt: "run tests",
+					agentScope: "user",
+					createdAt: Date.now(),
+					intervalMs: 3_600_000,
+					nextRunAt: Date.now() + 3_600_000,
+					[obsoleteKey]: "ultra",
+				},
+			],
+		}),
+	);
+
+	await controller.start({} as any, {
+		cwd,
+		sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "" },
+		ui: { notify: () => undefined },
+	} as any);
+	assert.equal((controller.list()[0] as Record<string, unknown>)[obsoleteKey], undefined);
+
+	const added = await controller.add({ name: "new", schedule: "+1h", prompt: "new job" });
+	assert.equal(added.ok, true);
+	const saved = JSON.parse(await fs.readFile(path.join(storageDir, "test-session.json"), "utf-8"));
+	assert.equal(saved.jobs.some((job: Record<string, unknown>) => obsoleteKey in job), false);
+});

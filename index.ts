@@ -457,7 +457,6 @@ export default function (pi: ExtensionAPI) {
 				params.agent ?? run.agent,
 				fallbackModel,
 				fallbackThinkingLevel,
-				params.ponytailMode ?? run.ponytailMode,
 				buildFollowUpTask(run, question, params.context),
 				params.cwd ?? run.cwd,
 				undefined,
@@ -679,7 +678,6 @@ export default function (pi: ExtensionAPI) {
 						step.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
-						step.ponytailMode ?? params.ponytailMode,
 						taskWithContext,
 						step.cwd,
 						i + 1,
@@ -721,7 +719,6 @@ export default function (pi: ExtensionAPI) {
 					messages: [],
 					stderr: "",
 					usage: makeEmptyUsage(),
-					ponytailMode: task.ponytailMode ?? params.ponytailMode,
 				}));
 
 				const emitParallelUpdate = () => {
@@ -741,7 +738,6 @@ export default function (pi: ExtensionAPI) {
 						task.agent,
 						fallbackModel,
 						fallbackThinkingLevel,
-						task.ponytailMode ?? params.ponytailMode,
 						task.task,
 						task.cwd,
 						undefined,
@@ -781,7 +777,6 @@ export default function (pi: ExtensionAPI) {
 					params.agent,
 					fallbackModel,
 					fallbackThinkingLevel,
-					params.ponytailMode,
 					params.task,
 					params.cwd,
 					undefined,

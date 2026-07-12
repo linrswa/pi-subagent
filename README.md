@@ -96,7 +96,7 @@ Then inspect it with:
 | Parallel | `{ "tasks": [{ "agent": "explorer", "task": "..." }] }` |
 | Chain | `{ "chain": [{ "agent": "explorer", "task": "..." }, { "agent": "planner", "task": "Use {previous}" }] }` |
 
-Optional fields: `cwd`, `agentScope`, `confirmProjectAgents`, and `ponytailMode` (`off`, `lite`, `full`, `ultra`).
+Optional fields: `cwd`, `agentScope`, and `confirmProjectAgents`.
 
 ## Commands and prompt templates
 
@@ -123,7 +123,6 @@ name: my-agent
 description: What this subagent is good at
 tools: read, grep, find, ls
 model: anthropic/claude-haiku-4-5  # optional
-ponytailMode: ultra                # optional: off, lite, full, ultra
 ---
 
 System prompt for the agent goes here.

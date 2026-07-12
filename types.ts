@@ -1,4 +1,4 @@
-import type { AgentScope, AgentSource, PonytailMode } from "./agents.ts";
+import type { AgentScope, AgentSource } from "./agents.ts";
 
 export type SubagentMode = "single" | "parallel" | "chain";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "aborted";
@@ -51,7 +51,6 @@ export interface SubagentRun {
 	errorMessage?: string;
 	usage: UsageStats;
 	model?: string;
-	ponytailMode?: PonytailMode;
 	abort?: () => void;
 }
 
@@ -65,7 +64,6 @@ export interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
-	ponytailMode?: PonytailMode;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
@@ -91,7 +89,6 @@ export type TaskItem = {
 	agent: string;
 	task: string;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 };
 
 export type SubagentParamsInput = {
@@ -102,7 +99,6 @@ export type SubagentParamsInput = {
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 };
 
 export type SubagentControlAction = "list" | "status" | "ask" | "stop" | "delete";
@@ -115,7 +111,6 @@ export type SubagentControlParamsInput = {
 	agent?: string;
 	agentScope?: AgentScope;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 };
 
 export type BgAgentParamsInput = {
@@ -124,7 +119,6 @@ export type BgAgentParamsInput = {
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 };
 
 export type SubagentScheduleAction = "add" | "list" | "delete";
@@ -139,7 +133,6 @@ export type SubagentScheduleParamsInput = {
 	agent?: string;
 	agentScope?: AgentScope;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 };
 
 export interface SubagentScheduleJob {
@@ -150,7 +143,6 @@ export interface SubagentScheduleJob {
 	agent?: string;
 	agentScope: AgentScope;
 	cwd?: string;
-	ponytailMode?: PonytailMode;
 	createdAt: number;
 	intervalMs?: number;
 	nextRunAt?: number;
@@ -164,5 +156,5 @@ export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; n
 
 export type SubagentRunSubscriber = (runs: readonly SubagentRun[]) => void;
 export type CreateSubagentRunInput = Pick<SubagentRun, "mode" | "agent" | "agentSource" | "task"> &
-	Partial<Pick<SubagentRun, "step" | "cwd" | "model" | "ponytailMode">>;
+	Partial<Pick<SubagentRun, "step" | "cwd" | "model">>;
 export type SubagentRunPatch = Partial<Omit<SubagentRun, "id">>;

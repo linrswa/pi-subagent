@@ -156,7 +156,6 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		agentName,
 		fallbackModel,
 		fallbackThinkingLevel,
-		params.ponytailMode,
 		task,
 		params.cwd,
 		undefined,

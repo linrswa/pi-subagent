@@ -15,14 +15,12 @@ import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter, SettingsManager, withFi
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "package" | "user" | "project";
 export type AgentSettingsScope = "global" | "project";
-export type PonytailMode = "off" | "lite" | "full" | "ultra";
 
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
-	ponytailMode?: PonytailMode;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -59,11 +57,6 @@ function parseTools(value: unknown): string[] | undefined {
 	}
 
 	return undefined;
-}
-
-export function normalizePonytailMode(value: unknown): PonytailMode | undefined {
-	const mode = stringField(value)?.toLowerCase();
-	return mode === "off" || mode === "lite" || mode === "full" || mode === "ultra" ? mode : undefined;
 }
 
 function agentModelDefaultsFrom(settings: unknown): AgentModelDefaults {
@@ -165,7 +158,6 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			description,
 			tools: parseTools(frontmatter.tools),
 			model: stringField(frontmatter.model),
-			ponytailMode: normalizePonytailMode(frontmatter.ponytailMode),
 			systemPrompt: body.trim(),
 			source,
 			filePath,

@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
-import { type AgentScope, discoverAgents, normalizePonytailMode } from "./agents.ts";
+import { type AgentScope, discoverAgents } from "./agents.ts";
 import { MAX_DATE_MS, MAX_TIMER_DELAY_MS } from "./constants.ts";
 import { chooseBackgroundAgent, confirmProjectAgentIfNeeded, normalizeAgentRef, type SubagentManager } from "./manager.ts";
 import { formatShortRunId } from "./run-refs.ts";
@@ -121,8 +121,7 @@ export function formatScheduleList(jobs: readonly SubagentScheduleJob[]): string
 		.map((job) => {
 			const next = job.nextRunAt && job.nextRunAt <= MAX_DATE_MS ? `${new Date(job.nextRunAt).toISOString()} (${formatRelativeTime(job.nextRunAt)})` : "unscheduled";
 			const last = job.lastRunAt ? `\n  last: ${new Date(job.lastRunAt).toISOString()}${job.lastRunId ? ` ${formatShortRunId(job.lastRunId)}` : ""}` : "";
-			const ponytail = job.ponytailMode ? `\n  ponytail: ${job.ponytailMode}` : "";
-			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "explorer"} [${job.agentScope}]${ponytail}\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
+			return `${formatScheduleId(job.id)} ${job.kind} ${job.schedule}\n  agent: ${job.agent ?? "explorer"} [${job.agentScope}]\n  next: ${next}\n  prompt: ${compactPreview(job.prompt, 160)}${last}`;
 		})
 		.join("\n\n");
 }
@@ -218,7 +217,6 @@ export class SubagentSchedulerController {
 			agent: normalizeAgentRef(params.agent),
 			agentScope: params.agentScope ?? "user",
 			cwd: params.cwd,
-			ponytailMode: normalizePonytailMode(params.ponytailMode),
 			createdAt: Date.now(),
 			intervalMs: parsed.parsed.intervalMs,
 			nextRunAt: parsed.parsed.nextRunAt,
@@ -301,7 +299,6 @@ export class SubagentSchedulerController {
 			agentScope: job.agentScope,
 			confirmProjectAgents: false,
 			cwd: job.cwd,
-			ponytailMode: job.ponytailMode,
 		});
 		if (this.generation !== generation || this.jobs.get(id) !== job || this.ctx !== ctx || this.manager !== manager) return;
 		if (result.ok === true) {
@@ -334,7 +331,20 @@ export class SubagentSchedulerController {
 				if (job.kind === "interval" && (!job.intervalMs || job.intervalMs <= 0)) continue;
 				if (job.kind === "once" && !job.nextRunAt) continue;
 				const agentScope: AgentScope = job.agentScope === "project" || job.agentScope === "both" ? job.agentScope : "user";
-				loaded.set(job.id, { ...job, kind: job.kind, agentScope, ponytailMode: normalizePonytailMode(job.ponytailMode) } as SubagentScheduleJob);
+				loaded.set(job.id, {
+					id: job.id,
+					schedule: job.schedule,
+					kind: job.kind,
+					prompt: job.prompt,
+					agent: job.agent,
+					agentScope,
+					cwd: job.cwd,
+					createdAt: job.createdAt ?? Date.now(),
+					intervalMs: job.intervalMs,
+					nextRunAt: job.nextRunAt,
+					lastRunAt: job.lastRunAt,
+					lastRunId: job.lastRunId,
+				});
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.ctx?.ui.notify(`Failed to load subagent schedules: ${error instanceof Error ? error.message : String(error)}`, "warning");
