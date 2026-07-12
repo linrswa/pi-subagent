@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
-import { getChildSessionOwnerId } from "./child-sessions.ts";
+import { createFreshChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
 import { getResultOutput, isFailedResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { subagentRunStore } from "./store.ts";
@@ -161,6 +161,16 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		projectAgentsDir: discovery.projectAgentsDir,
 		results,
 	});
+	// Allocate the managed child session before calling runSingleAgent. Once its
+	// session arguments are supplied, runSingleAgent creates the run synchronously
+	// (before its next await), which is required by the background API.
+	let freshSession: Awaited<ReturnType<typeof createFreshChildSession>>;
+	try {
+		freshSession = await createFreshChildSession(getMainSessionOwnerId(ctx));
+	} catch (error) {
+		return { ok: false, message: `Failed to allocate child session: ${error instanceof Error ? error.message : String(error)}` };
+	}
+
 	let createdRun: SubagentRun | undefined;
 	const promise = runSingleAgent({
 		mode: "single",
@@ -173,6 +183,8 @@ export async function startBackgroundAgent(pi: ExtensionAPI, ctx: ExtensionConte
 		cwd: params.cwd,
 		agentScope,
 		ownerSessionId: getMainSessionOwnerId(ctx),
+		sessionId: freshSession.sessionId,
+		sessionDir: freshSession.sessionDir,
 		makeDetails,
 		onRunCreated: (run) => {
 			createdRun = run;

@@ -33,6 +33,46 @@ test("named schedules use the name as id", async (t) => {
 	assert.equal(await controller.delete("daily-tests"), true);
 });
 
+test("scheduled firing records the background run id", async (t) => {
+	const cwd = await tempDir();
+	const controller = new SubagentSchedulerController();
+	const started: unknown[] = [];
+	t.after(async () => {
+		controller.stop();
+		await fs.rm(cwd, { recursive: true, force: true });
+	});
+
+	const manager = {
+		startBackground: async (_ctx: unknown, params: unknown) => {
+			started.push(params);
+			return { ok: true as const, run: { id: "subagent-scheduled-run" }, agentScope: "user" as const };
+		},
+	};
+	const ctx = {
+		cwd,
+		sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "" },
+		ui: { notify: () => undefined },
+	} as any;
+	await controller.start(manager as any, ctx);
+	const added = await controller.add({ name: "repeat", schedule: "30s", prompt: "run scheduled work" });
+	assert.equal(added.ok, true);
+	if (!added.ok) return;
+	const job = (controller as any).jobs.get(added.job.id);
+	job.nextRunAt = Date.now();
+	await (controller as any).fire(job.id, (controller as any).generation);
+
+	assert.equal(started.length, 1);
+	assert.deepEqual(started[0], {
+		prompt: "run scheduled work",
+		agent: undefined,
+		agentScope: "user",
+		confirmProjectAgents: false,
+		cwd: undefined,
+	});
+	assert.equal(controller.list()[0]?.lastRunId, "subagent-scheduled-run");
+	assert.ok(controller.list()[0]?.lastRunAt);
+});
+
 test("generated schedule ids still display short", () => {
 	assert.equal(formatScheduleId("schedule-mabc1234-zzzz"), "mabc1234-zzzz");
 	assert.equal(formatScheduleId("schedule-daily-tests"), "schedule-daily-tests");
