@@ -163,11 +163,15 @@ export type SubagentParamsInput = {
 	cwd?: string;
 };
 
-export type SubagentControlAction = "list" | "status" | "stop" | "delete";
+export type SubagentControlAction = "list" | "status" | "send" | "stop" | "delete";
 
 export type SubagentControlParamsInput = {
 	action?: SubagentControlAction;
 	runId?: string;
+	/** Instruction for action=send. */
+	message?: string;
+	/** steer is delivered at the next safe turn boundary; followUp runs after current work. */
+	delivery?: SubagentInputDelivery;
 };
 
 export type SubagentScheduleAction = "add" | "list" | "delete";

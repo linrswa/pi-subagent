@@ -55,9 +55,10 @@ test("pi loads this package and registers the public tools, commands, and schema
 				removedBgTool: !tools.includes("bg_agent"),
 				removedTasks: !subagentSchema.includes('"tasks"'),
 				controlHasAsk: controlSchema.includes("ask"),
+				controlHasSend: controlSchema.includes('"send"') && controlSchema.includes('"message"'),
 				legacyModePresent: [subagentSchema, controlSchema, ...pi.getAllTools().map((tool) => JSON.stringify(tool.parameters ?? {}))].some((schema) => schema.toLowerCase().includes("pony" + "tailmode")),
 			};
-			const valid = payload.missingTools.length === 0 && payload.missingCommands.length === 0 && payload.missingPrompts.length === 0 && payload.continueFrom && payload.wait && payload.removedBgTool && payload.removedTasks && !payload.controlHasAsk && !payload.legacyModePresent;
+			const valid = payload.missingTools.length === 0 && payload.missingCommands.length === 0 && payload.missingPrompts.length === 0 && payload.continueFrom && payload.wait && payload.removedBgTool && payload.removedTasks && !payload.controlHasAsk && payload.controlHasSend && !payload.legacyModePresent;
 			ctx.ui.notify(JSON.stringify(payload), valid ? "info" : "error");
 			ctx.shutdown();
 		},
@@ -79,7 +80,7 @@ test("pi loads this package and registers the public tools, commands, and schema
 		const notify = events.find((event) => event.type === "extension_ui_request" && event.method === "notify" && event.message?.includes("missingTools"));
 		assert.ok(notify, result.stdout);
 		assert.deepEqual(JSON.parse(notify.message), {
-			missingTools: [], missingCommands: [], missingPrompts: [], continueFrom: true, wait: true, removedBgTool: true, removedTasks: true, controlHasAsk: false, legacyModePresent: false,
+			missingTools: [], missingCommands: [], missingPrompts: [], continueFrom: true, wait: true, removedBgTool: true, removedTasks: true, controlHasAsk: false, controlHasSend: true, legacyModePresent: false,
 		});
 		assert.equal(events.find((event) => event.id === "probe")?.success, true, result.stdout);
 	} finally {

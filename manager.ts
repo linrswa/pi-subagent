@@ -8,7 +8,7 @@ import { runSingleAgent } from "./runner.ts";
 import { OwnerRunLifecycle } from "./run-lifecycle.ts";
 import { subagentRunStore, type SubagentRunStore } from "./store.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
-import type { OnUpdateCallback, SingleResult, StartedAgentRun, SubagentDetails, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
+import type { OnUpdateCallback, SingleResult, StartedAgentRun, SubagentDetails, SubagentInputDelivery, SubagentMode, SubagentParamsInput, SubagentRun } from "./types.ts";
 
 /**
  * Persisted parents use their Pi session id; --no-session parents share a
@@ -267,6 +267,13 @@ export async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params
 	return { ok: true, run: createdRun, completion, agentScope };
 }
 
+export interface SendRunInputResult {
+	accepted: boolean;
+	queued?: boolean;
+	targetRun?: SubagentRun;
+	message?: string;
+}
+
 export interface DeleteRunResult {
 	deleted: boolean;
 	message?: string;
@@ -303,6 +310,37 @@ export class SubagentManager {
 
 	stopRun(runId: string): boolean {
 		return this.store.abort(runId);
+	}
+
+	/** Send one instruction to a queued/running run, routing chain parents to their active child. */
+	async sendRunInput(runId: string, message: string, delivery: SubagentInputDelivery = "steer"): Promise<SendRunInputResult> {
+		const source = this.findRun(runId);
+		if (!source) return { accepted: false, message: "Unknown subagent run." };
+		const trimmed = message.trim();
+		if (!trimmed) return { accepted: false, message: "A message is required to guide the subagent." };
+
+		const isLive = (run: SubagentRun) => run.status === "queued" || run.status === "running";
+		let target = isLive(source) && source.sendInput ? source : undefined;
+		if (!target && isLive(source) && source.childRunIds?.length) {
+			for (const childId of [...source.childRunIds].reverse()) {
+				const child = this.store.get(childId, source.ownerSessionId);
+				if (child && isLive(child) && child.sendInput) {
+					target = child;
+					break;
+				}
+			}
+		}
+		if (!isLive(source)) {
+			return { accepted: false, message: `${formatShortRunId(source.id)} is already ${source.status}; use subagent continueFrom for more work.` };
+		}
+		if (!target?.sendInput) return { accepted: false, message: `${formatShortRunId(source.id)} is not connected to a live child yet.` };
+
+		try {
+			const disposition = await target.sendInput(trimmed, delivery);
+			return { accepted: true, queued: disposition === "queued", targetRun: target };
+		} catch (error) {
+			return { accepted: false, targetRun: target, message: error instanceof Error ? error.message : String(error) };
+		}
 	}
 
 	/**

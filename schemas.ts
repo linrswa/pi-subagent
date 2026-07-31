@@ -45,11 +45,18 @@ export const SubagentControlParamsSchema = {
 	properties: {
 		action: {
 			type: "string",
-			enum: ["list", "status", "stop", "delete"],
+			enum: ["list", "status", "send", "stop", "delete"],
 			default: "list",
-			description: "Control action. list summarizes runs; status inspects one run; stop aborts; delete removes.",
+			description: "Control action. list/status inspect; send guides a live run; stop aborts; delete removes.",
 		},
-		runId: { type: "string", description: "Run id required for status, stop, and delete; e.g. subagent-3, &3, or 3." },
+		runId: { type: "string", description: "Run id required for status, send, stop, and delete; e.g. subagent-3, &3, or 3." },
+		message: { type: "string", description: "Instruction to add to a queued or running subagent (action=send)." },
+		delivery: {
+			type: "string",
+			enum: ["steer", "followUp"],
+			default: "steer",
+			description: "send delivery: steer guides at the next safe turn boundary (default); followUp waits for current work to finish.",
+		},
 	},
 } as const;
 

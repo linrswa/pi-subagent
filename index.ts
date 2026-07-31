@@ -329,11 +329,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_control",
 		label: "Subagent Control",
-		description: "Inspect and control existing subagent runs: list, status, stop, or delete.",
-		promptSnippet: "Use subagent_control to list/status subagent runs, stop runs, or delete runs. Use subagent continueFrom for follow-up work.",
+		description: "Inspect and control subagents: list, status, send guidance to a live run, stop, or delete.",
+		promptSnippet: "Use subagent_control to inspect runs or send a simple instruction to a queued/running subagent; use subagent continueFrom only after a run closes.",
 		promptGuidelines: [
 			"Use action=list before referring to subagents if the run id is unclear.",
-			"runId accepts subagent-3, &3, or 3 and is required for status, stop, and delete.",
+			"runId accepts subagent-3, &3, or 3 and is required for status, send, stop, and delete.",
+			"Use subagent_control action=send with message to guide a queued/running run; omit delivery for the normal steer behavior.",
+			"Use delivery=followUp only when the added instruction should wait until the subagent finishes its current work.",
 			"Use subagent with continueFrom and task to continue a completed run; control actions never start agents.",
 		],
 		parameters: SubagentControlParamsSchema as never,
@@ -341,7 +343,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			const params = rawParams as SubagentControlParamsInput;
 			const action = params.action ?? "list";
-			if (!["list", "status", "stop", "delete"].includes(action)) {
+			if (!["list", "status", "send", "stop", "delete"].includes(action)) {
 				return { content: [{ type: "text", text: `Unsupported control action: ${String(action)}.` }], details: { action } };
 			}
 			const runs = subagentManager.listRuns();
@@ -363,6 +365,20 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: formatRunDetails(run) }], details: { action, runId: run.id } };
 			}
 
+			if (action === "send") {
+				const sent = await subagentManager.sendRunInput(run.id, params.message ?? "", params.delivery ?? "steer");
+				if (!sent.accepted) {
+					return { content: [{ type: "text", text: `Could not guide ${formatShortRunId(run.id)}: ${sent.message ?? "unknown error"}` }], details: { action, runId: run.id, accepted: false } };
+				}
+				const target = sent.targetRun && sent.targetRun.id !== run.id
+					? `${formatShortRunId(sent.targetRun.id)} (active child of ${formatShortRunId(run.id)})`
+					: formatShortRunId(run.id);
+				return {
+					content: [{ type: "text", text: `${sent.queued ? "Queued guidance for" : "Sent guidance to"} ${target}.` }],
+					details: { action, runId: run.id, targetRunId: sent.targetRun?.id, accepted: true, queued: sent.queued },
+				};
+			}
+
 			if (action === "stop") {
 				const stopped = subagentManager.stopRun(run.id);
 				return { content: [{ type: "text", text: stopped ? `Stopping ${formatShortRunId(run.id)}.` : `${formatShortRunId(run.id)} is not running.` }], details: { action, runId: run.id } };
@@ -378,7 +394,8 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args: SubagentControlParamsInput, theme) {
 			const action = args.action ?? "list";
 			const target = args.runId ? ` ${args.runId}` : "";
-			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_control "))}${theme.fg("accent", action)}${theme.fg("dim", target)}`, 0, 0);
+			const message = action === "send" && args.message ? `: ${compactPreview(args.message, 60)}` : "";
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_control "))}${theme.fg("accent", action)}${theme.fg("dim", `${target}${message}`)}`, 0, 0);
 		},
 
 		renderResult(result, _options, theme) {
