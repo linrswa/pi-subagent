@@ -7,23 +7,17 @@ import test from "node:test";
 import { getChildSessionsRoot } from "../child-sessions.ts";
 import { startChain } from "../chain-runner.ts";
 import { subagentRunStore } from "../store.ts";
+import { fakeRpcPiSource } from "./fake-rpc-pi.ts";
 
 test("background chain has a cancellable parent run and passes previous output", async (t) => {
 	const owner = `chain-test-${randomUUID()}`;
 	const temp = await mkdtemp(path.join(tmpdir(), "pi-subagent-chain-"));
 	const script = path.join(temp, "fake-pi.mjs");
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-	await writeFile(script, `
-import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
-const task = args.at(-1);
-const answer = task.includes("first") ? "alpha" : "received:" + task;
-const manager = SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
-manager.appendMessage({ role: "user", content: task, timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: answer, provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" } }));
-`);
+	await writeFile(script, fakeRpcPiSource(sdkUrl, {
+		answerExpression: 'task.includes("first") ? "alpha" : "received:" + task',
+		delayMs: 40,
+	}));
 	const originalScript = process.argv[1];
 	process.argv[1] = script;
 	t.after(async () => {

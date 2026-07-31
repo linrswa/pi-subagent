@@ -57,6 +57,8 @@ export class SubagentRunStore {
 			messages: patch.messages ? [...patch.messages] : existing.messages,
 			usage: patch.usage ? cloneUsageStats(patch.usage) : existing.usage,
 			childRunIds: patch.childRunIds ? [...patch.childRunIds] : existing.childRunIds,
+			currentToolArgs: "currentToolArgs" in patch ? (patch.currentToolArgs ? { ...patch.currentToolArgs } : undefined) : existing.currentToolArgs,
+			pendingInputs: "pendingInputs" in patch ? patch.pendingInputs?.map((input) => ({ ...input })) : existing.pendingInputs,
 		};
 		this.runs.set(key, next);
 		this.notifyChange(next);
@@ -118,7 +120,14 @@ export class SubagentRunStore {
 	}
 	private key(ownerSessionId: string, id: string): string { return `${ownerSessionId}\u0000${id}`; }
 	private cloneRun(run: SubagentRun): SubagentRun {
-		return { ...run, messages: [...run.messages], usage: cloneUsageStats(run.usage), childRunIds: run.childRunIds ? [...run.childRunIds] : undefined };
+		return {
+			...run,
+			messages: [...run.messages],
+			usage: cloneUsageStats(run.usage),
+			childRunIds: run.childRunIds ? [...run.childRunIds] : undefined,
+			currentToolArgs: run.currentToolArgs ? { ...run.currentToolArgs } : undefined,
+			pendingInputs: run.pendingInputs?.map((input) => ({ ...input })),
+		};
 	}
 	private notify(): void {
 		for (const [subscriber, ownerSessionId] of this.subscribers) {

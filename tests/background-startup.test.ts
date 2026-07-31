@@ -8,6 +8,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getChildSessionsRoot } from "../child-sessions.ts";
 import { startAgent } from "../manager.ts";
 import { subagentRunStore } from "../store.ts";
+import { fakeRpcPiSource } from "./fake-rpc-pi.ts";
 
 async function waitForTerminal(runId: string, ownerSessionId: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
@@ -23,18 +24,7 @@ test("background startup creates a managed run before the child completes", asyn
 	const temp = await mkdtemp(path.join(tmpdir(), "pi-subagent-background-"));
 	const script = path.join(temp, "fake-pi.mjs");
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-	await writeFile(
-		script,
-		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
-if (args.includes("--no-session") || value("--exclude-tools") !== "subagent,subagent_schedule") process.exit(2);
-const manager = SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
-manager.appendMessage({ role: "user", content: "child task", timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: "child answer", provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "child answer" }], stopReason: "stop" } }));
-`,
-	);
+	await writeFile(script, fakeRpcPiSource(sdkUrl));
 	const originalScript = process.argv[1];
 	process.argv[1] = script;
 	t.after(async () => {

@@ -3,6 +3,8 @@ import type { AgentScope, AgentSource } from "./agents.ts";
 export type SubagentMode = "single" | "chain";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "aborted";
 export type CompletionNotificationState = "pending" | "delivered" | "suppressed";
+export type SubagentInputDelivery = "steer" | "followUp";
+export type SubagentPendingInput = { message: string; delivery: SubagentInputDelivery };
 
 export interface UsageStats {
 	input: number;
@@ -49,6 +51,11 @@ export interface SubagentRun {
 	step?: number;
 	cwd?: string;
 	currentTool?: string;
+	currentToolArgs?: Record<string, unknown>;
+	/** Bounded, ephemeral streaming state used only by the live viewer. */
+	liveMessage?: string;
+	liveToolOutput?: string;
+	pendingInputs?: SubagentPendingInput[];
 	messages: AgentMessage[];
 	finalOutput?: string;
 	errorMessage?: string;
@@ -68,6 +75,8 @@ export interface SubagentRun {
 	childRunIds?: string[];
 	/** Durable background completion-delivery state; absent on legacy runs. */
 	completionNotification?: CompletionNotificationState;
+	/** Ephemeral input channel owned by the live child process; never persisted. */
+	sendInput?: (message: string, delivery: SubagentInputDelivery) => Promise<"queued" | "sent">;
 	abort?: () => void;
 }
 

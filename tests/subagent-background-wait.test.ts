@@ -7,6 +7,7 @@ import test from "node:test";
 import registerExtension from "../index.ts";
 import { getChildSessionsRoot } from "../child-sessions.ts";
 import { subagentRunStore } from "../store.ts";
+import { fakeRpcPiSource } from "./fake-rpc-pi.ts";
 
 async function waitForTerminal(runId: string, owner: string): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -22,16 +23,7 @@ test("subagent defaults to background and wait=true returns final output", async
 	const temp = await mkdtemp(path.join(tmpdir(), "pi-subagent-tool-background-"));
 	const script = path.join(temp, "fake-pi.mjs");
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-	await writeFile(script, `
-import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
-await new Promise((resolve) => setTimeout(resolve, 160));
-const manager = SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
-manager.appendMessage({ role: "user", content: args.at(-1), timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: "finished", provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop" } }));
-`);
+	await writeFile(script, fakeRpcPiSource(sdkUrl, { answerExpression: JSON.stringify("finished"), delayMs: 160 }));
 	const originalScript = process.argv[1];
 	process.argv[1] = script;
 	t.after(async () => {

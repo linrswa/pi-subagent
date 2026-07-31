@@ -10,6 +10,7 @@ import { getResultOutput, toParentResult } from "../results.ts";
 import { runSingleAgent } from "../runner.ts";
 import { subagentRunStore } from "../store.ts";
 import type { SubagentDetails } from "../types.ts";
+import { fakeRpcPiSource } from "./fake-rpc-pi.ts";
 
 const makeDetails = (results: any[]): SubagentDetails => ({
 	mode: "single",
@@ -26,18 +27,7 @@ test("continuations fork an isolated session and send only the new task", async 
 	const script = path.join(temp, "fake-pi.mjs");
 	const sessionDir = path.join(getChildSessionsRoot(), owner);
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-	await writeFile(
-		script,
-		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const sessionFile = args[args.indexOf("--session") + 1];
-const task = args.at(-1);
-const manager = SessionManager.open(sessionFile);
-manager.appendMessage({ role: "user", content: task, timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: "answer: " + task, provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer: " + task }], stopReason: "stop" } }));
-`,
-	);
+	await writeFile(script, fakeRpcPiSource(sdkUrl, { answerExpression: '"answer: " + task' }));
 	const source = SessionManager.create(process.cwd(), sessionDir, { id: randomUUID() });
 	source.appendMessage({ role: "user", content: "source question", timestamp: Date.now() } as any);
 	const sourceLeaf = source.appendMessage({ role: "assistant", content: "source answer", provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" } as any);
@@ -79,17 +69,7 @@ test("fresh runner invocations use distinct persisted child sessions", async () 
 	const temp = await mkdtemp(path.join(tmpdir(), "pi-subagent-runner-"));
 	const script = path.join(temp, "fake-pi.mjs");
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-	await writeFile(
-		script,
-		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
-const manager = SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
-manager.appendMessage({ role: "user", content: "child task", timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: "child answer", provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "child answer" }], stopReason: "stop" } }));
-`,
-	);
+	await writeFile(script, fakeRpcPiSource(sdkUrl));
 	const originalScript = process.argv[1];
 	process.argv[1] = script;
 	try {
@@ -114,10 +94,10 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 			assert.equal(stored?.sessionFile, result.sessionFile);
 			assert.equal(stored?.leafId, result.leafId);
 			const context = SessionManager.open(result.sessionFile!).buildSessionContext();
-			assert.deepEqual(context.messages.map((message) => message.content), ["child task", "child answer"]);
+			assert.deepEqual(context.messages.map((message) => message.content), ["Task: persist this", "child answer"]);
 			const viewerMessages = await readChildSessionMessages(result.sessionFile!, result.leafId);
 			assert.deepEqual(viewerMessages.map((message) => message.content), [
-				[{ type: "text", text: "child task" }],
+				[{ type: "text", text: "Task: persist this" }],
 				[{ type: "text", text: "child answer" }],
 			]);
 		}
@@ -136,22 +116,9 @@ test("process-level session lifecycle preserves source context, isolates sibling
 	const script = path.join(temp, "fake-pi.mjs");
 	const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
 	const sourceTranscript = "SOURCE TRANSCRIPT: original investigation";
-	await writeFile(
-		script,
-		`import { SessionManager } from ${JSON.stringify(sdkUrl)};
-const args = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
-const task = args.at(-1);
-const manager = args.includes("--session")
-  ? SessionManager.open(value("--session"))
-  : SessionManager.create(process.cwd(), value("--session-dir"), { id: value("--session-id") });
-const prior = manager.buildSessionContext().messages.map((message) => String(message.content));
-const answer = "answer: " + task + "; source-context=" + prior.some((content) => content.includes("SOURCE TRANSCRIPT")) + "; sibling-a-context=" + prior.some((content) => content.includes("follow up A"));
-manager.appendMessage({ role: "user", content: task, timestamp: Date.now() });
-manager.appendMessage({ role: "assistant", content: answer, provider: "test", model: "test", timestamp: Date.now(), usage: { input: 1, output: 1, totalTokens: 2 }, stopReason: "stop" });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" } }));
-`,
-	);
+	await writeFile(script, fakeRpcPiSource(sdkUrl, {
+		answerExpression: '"answer: " + task + "; source-context=" + prior.some((content) => content.includes("SOURCE TRANSCRIPT")) + "; sibling-a-context=" + prior.some((content) => content.includes("follow up A"))',
+	}));
 	const originalScript = process.argv[1];
 	process.argv[1] = script;
 	try {
