@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, type Component, type OverlayOptions, type TUI } from "@earendil-works/pi-tui";
 import { readChildSessionMessages } from "./child-sessions.ts";
 import { getFinalOutput } from "./results.ts";
+import type { SendRunInputResult } from "./manager.ts";
 import { findRunByRef, formatShortRunId } from "./run-refs.ts";
 import { subagentRunStore } from "./store.ts";
 import type { RunStatus, SubagentRun, TextContent, ToolCallContent, UsageStats } from "./types.ts";
@@ -111,8 +112,9 @@ function formatToolCall(toolName: string, args: Record<string, unknown>, theme: 
 
 const SUBAGENT_VIEWER_OVERLAY_OPTIONS: OverlayOptions = { width: "75%", minWidth: 60, maxHeight: "90%" };
 
-class SubagentRunViewerComponent implements Component {
+export class SubagentRunViewerComponent implements Component {
 	private run: SubagentRun | undefined;
+	private activeChild: SubagentRun | undefined;
 	private scrollTop = 0;
 	private followTail = true;
 	private confirmStop = false;
@@ -127,16 +129,21 @@ class SubagentRunViewerComponent implements Component {
 	private readonly ownerSessionId: string;
 	private readonly done: () => void;
 	private readonly stopRun: (runId: string) => void;
+	private readonly guideRun?: (runId: string) => void;
 
-	constructor(tui: TUI, theme: RunViewerTheme, runId: string, ownerSessionId: string, done: () => void, stopRun: (runId: string) => void) {
+	constructor(tui: TUI, theme: RunViewerTheme, runId: string, ownerSessionId: string, done: () => void, stopRun: (runId: string) => void, guideRun?: (runId: string) => void) {
 		this.tui = tui;
 		this.theme = theme;
 		this.runId = runId;
 		this.ownerSessionId = ownerSessionId;
 		this.done = done;
 		this.stopRun = stopRun;
+		this.guideRun = guideRun;
 		this.unsubscribe = subagentRunStore.subscribe((runs) => {
 			this.run = runs.find((candidate) => candidate.id === runId && candidate.ownerSessionId === ownerSessionId);
+			this.activeChild = this.run?.childRunIds?.length
+				? [...this.run.childRunIds].reverse().map((id) => runs.find((candidate) => candidate.id === id)).find(Boolean)
+				: undefined;
 			if (this.run && this.run.status !== "running" && this.run.status !== "queued" && this.run.sessionFile && this.loadedSessionFile !== this.run.sessionFile) {
 				this.loadedSessionFile = this.run.sessionFile;
 				void readChildSessionMessages(this.run.sessionFile, this.run.leafId)
@@ -153,6 +160,11 @@ class SubagentRunViewerComponent implements Component {
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "q") || matchesKey(data, "escape")) return this.done();
+		if (matchesKey(data, "i")) {
+			this.confirmStop = false;
+			if (this.run && (this.run.status === "queued" || this.run.status === "running")) this.guideRun?.(this.run.id);
+			return;
+		}
 		if (matchesKey(data, "x")) {
 			if (this.confirmStop && this.run) this.stopRun(this.run.id);
 			this.confirmStop = !this.confirmStop;
@@ -184,7 +196,12 @@ class SubagentRunViewerComponent implements Component {
 			if (parent) lines.push(this.row(`${this.theme.fg("muted", "parent run: ")}${this.theme.fg("dim", parent)}`, innerW));
 			if (run.parentRunId) lines.push(this.row(`${this.theme.fg("muted", "chain parent: ")}${this.theme.fg("dim", `${formatShortRunId(run.parentRunId)} (${run.parentRunId})`)}`, innerW));
 			if (run.childRunIds?.length) lines.push(this.row(`${this.theme.fg("muted", "child runs: ")}${this.theme.fg("dim", run.childRunIds.map(formatShortRunId).join(", "))}`, innerW));
-			if (run.currentTool) lines.push(this.row(`${this.theme.fg("muted", "tool: ")}${this.theme.fg("toolOutput", run.currentTool)}`, innerW));
+			if (this.activeChild && (run.status === "queued" || run.status === "running")) lines.push(this.row(`${this.theme.fg("muted", "active child: ")}${this.theme.fg("accent", `${formatShortRunId(this.activeChild.id)} ${this.activeChild.agent}`)}`, innerW));
+			if (run.currentTool) {
+				const tool = run.currentToolArgs ? formatToolCall(run.currentTool, run.currentToolArgs, this.theme) : this.theme.fg("toolOutput", run.currentTool);
+				lines.push(this.row(`${this.theme.fg("muted", "tool: ")}${tool}`, innerW));
+			}
+			if (run.pendingInputs?.length) lines.push(this.row(`${this.theme.fg("muted", "guidance queued: ")}${this.theme.fg("warning", String(run.pendingInputs.length))}`, innerW));
 			if (usage) lines.push(this.row(`${this.theme.fg("muted", "usage: ")}${this.theme.fg("dim", usage)}`, innerW));
 		}
 
@@ -200,9 +217,10 @@ class SubagentRunViewerComponent implements Component {
 
 		const end = Math.min(body.length, this.scrollTop + bodyRows);
 		const position = body.length ? `${this.scrollTop + 1}-${end}/${body.length}` : "0/0";
+		const canGuide = Boolean(run && (run.status === "queued" || run.status === "running") && this.guideRun);
 		const footer = this.confirmStop
 			? "press x again to stop run • q/Esc close"
-			: `j/k/↑↓ scroll • PgUp/PgDn • Home/End • x x stop • q/Esc close • ${position}`;
+			: `j/k/↑↓ scroll • PgUp/PgDn • Home/End${canGuide ? " • i guide" : ""} • x x stop • q/Esc close • ${position}`;
 		lines.push(this.border(`├${"─".repeat(innerW)}┤`));
 		lines.push(this.row(this.theme.fg("dim", footer), innerW));
 		lines.push(this.border(`╰${"─".repeat(innerW)}╯`));
@@ -218,9 +236,11 @@ class SubagentRunViewerComponent implements Component {
 	private bodyLines(run: SubagentRun | undefined): string[] {
 		if (!run) return [this.theme.fg("warning", `Subagent ${this.runId} was deleted`)];
 		const lines: string[] = [];
+		const displayRun = this.activeChild && (run.status === "running" || run.status === "queued") ? this.activeChild : run;
+		if (displayRun !== run) lines.push(this.theme.fg("muted", `── active child ${formatShortRunId(displayRun.id)} ${displayRun.agent}`));
 		// Live runs use the in-memory store. Completed runs reload their active
 		// branch from the child session, rather than relying on parent details.
-		const messages = run.status === "running" || run.status === "queued" ? run.messages : (this.persistedMessages ?? run.messages);
+		const messages = displayRun.status === "running" || displayRun.status === "queued" ? displayRun.messages : (displayRun === run ? this.persistedMessages ?? displayRun.messages : displayRun.messages);
 		for (const message of messages) {
 			const usage = message.usage
 				? formatUsageStats(
@@ -250,13 +270,26 @@ class SubagentRunViewerComponent implements Component {
 			if (usage) lines.push(this.theme.fg("dim", usage));
 		}
 
-		const finalOutput = run.finalOutput || getFinalOutput(messages);
-		if (finalOutput) {
+		if (displayRun.liveMessage) {
+			lines.push("", this.theme.fg("warning", "── assistant (streaming)"));
+			this.pushText(lines, displayRun.liveMessage);
+		}
+		if (displayRun.liveToolOutput) {
+			lines.push("", this.theme.fg("warning", `── ${displayRun.currentTool ?? "tool"} output (live)`));
+			this.pushText(lines, displayRun.liveToolOutput);
+		}
+		if (displayRun.pendingInputs?.length) {
+			lines.push("", this.theme.fg("muted", "── queued guidance"));
+			for (const input of displayRun.pendingInputs.slice(-5)) this.pushText(lines, `[${input.delivery}] ${compactPreview(input.message, 300)}`);
+		}
+
+		const finalOutput = displayRun.finalOutput || getFinalOutput(messages);
+		if (finalOutput && displayRun.status !== "running" && displayRun.status !== "queued") {
 			lines.push("", this.theme.fg("muted", "── final output"));
 			this.pushText(lines, finalOutput);
 		}
-		if (run.errorMessage) lines.push("", this.theme.fg("error", `Error: ${run.errorMessage}`));
-		if (lines.length === 0) lines.push(this.theme.fg("muted", run.status === "running" || run.status === "queued" ? "(running...)" : "(no messages)"));
+		if (displayRun.errorMessage) lines.push("", this.theme.fg("error", `Error: ${displayRun.errorMessage}`));
+		if (lines.length === 0) lines.push(this.theme.fg("muted", displayRun.status === "running" || displayRun.status === "queued" ? "(running...)" : "(no messages)"));
 		return lines;
 	}
 
@@ -296,18 +329,39 @@ class SubagentRunViewerComponent implements Component {
 	}
 }
 
-export function openSubagentRunViewer(ctx: ExtensionContext, runId: string, ownerSessionId = subagentRunStore.getActiveOwner()): void {
+export function openSubagentRunViewer(
+	ctx: ExtensionContext,
+	runId: string,
+	ownerSessionId = subagentRunStore.getActiveOwner(),
+	sendRunInput?: (runId: string, message: string) => Promise<SendRunInputResult>,
+): void {
 	if (ctx.mode !== "tui") {
 		const run = findRunByRef(runId, subagentRunStore.getSnapshot(ownerSessionId));
 		ctx.ui.notify(run ? formatRunList([run]) : `Unknown subagent run: ${runId}`, run ? "info" : "warning");
 		return;
 	}
+	const guideRun = sendRunInput
+		? (targetRunId: string) => {
+			void ctx.ui.input(`Guide ${formatShortRunId(targetRunId)}`, "What should it change or do next?")
+				.then(async (message) => {
+					if (!message?.trim()) return;
+					const result = await sendRunInput(targetRunId, message);
+					if (!result.accepted) {
+						ctx.ui.notify(result.message ?? "Could not guide subagent.", "warning");
+						return;
+					}
+					const target = result.targetRun ? formatShortRunId(result.targetRun.id) : formatShortRunId(targetRunId);
+					ctx.ui.notify(`${result.queued ? "Queued guidance for" : "Sent guidance to"} ${target}.`, "info");
+				})
+				.catch((error) => ctx.ui.notify(`Could not guide subagent: ${error instanceof Error ? error.message : String(error)}`, "error"));
+		}
+		: undefined;
 	void ctx.ui
 		.custom<void>(
 			(tui, theme, _keybindings, done) =>
 				new SubagentRunViewerComponent(tui, theme, runId, ownerSessionId, done, (targetRunId) => {
 					if (!subagentRunStore.abort(targetRunId, ownerSessionId)) ctx.ui.notify(`${formatShortRunId(targetRunId)} is not running.`, "warning");
-				}),
+				}, guideRun),
 			{ overlay: true, overlayOptions: SUBAGENT_VIEWER_OVERLAY_OPTIONS },
 		)
 		.catch((error) => ctx.ui.notify(`Subagent view failed: ${error instanceof Error ? error.message : String(error)}`, "error"));

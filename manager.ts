@@ -140,6 +140,8 @@ export function formatRunDetails(run: SubagentRun): string {
 		`task: ${run.task || "(none)"}`,
 		`cwd: ${run.cwd ?? "(none)"}`,
 		`current tool: ${run.currentTool ?? "(none)"}`,
+		`live output: ${run.liveToolOutput || run.liveMessage ? compactPreview(run.liveToolOutput || run.liveMessage, 300) : "(none)"}`,
+		`queued guidance: ${run.pendingInputs?.length ?? 0}`,
 		`model: ${run.model ?? "(none)"}`,
 		`usage: ${usage}`,
 		`final output: ${output ?? "(none)"}`,
@@ -160,7 +162,7 @@ export function buildRunRefContext(text: string): string | undefined {
 		.map((ref) => findRunByRef(ref))
 		.filter((run): run is SubagentRun => Boolean(run))
 		.map((run) => {
-			const statusGuidance = `use subagent_control with runId ${formatShortRunId(run.id)} for status/stop/delete.`;
+			const statusGuidance = `use subagent_control with runId ${formatShortRunId(run.id)} for status/send/stop/delete.`;
 			const fullyClosed = ["completed", "failed", "aborted"].includes(run.status) && run.endedAt !== undefined && !run.abort;
 			const continuationEligible = fullyClosed && Boolean(run.sessionFile && run.leafId && run.cwd);
 			const followUp = continuationEligible

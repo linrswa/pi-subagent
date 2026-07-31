@@ -80,7 +80,7 @@ test("run-ref context directs follow-ups to continueFrom and autocomplete stays 
 	try {
 		const context = buildRunRefContext(`Continue ${formatRunRef(run.id)}`);
 		assert.ok(context);
-		assert.match(context, /subagent_control with runId &\d+ for status\/stop\/delete/);
+		assert.match(context, /subagent_control with runId &\d+ for status\/send\/stop\/delete/);
 		assert.match(context, /subagent with \{ continueFrom: "&\d+", task: "\.\.\." \}/);
 		assert.doesNotMatch(context, /\bask\b/i);
 

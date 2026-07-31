@@ -1,5 +1,7 @@
 # PRD：Session-backed Subagent Continuation 與 API 精簡
 
+> 歷史文件註記：本 PRD 的 `subagent_control` action 清單描述 v0.1.0。後續 live-steering 實作新增 `send`，它透過同一個執行中 RPC child session 傳遞指示，不是本文件已移除、會另開 run 的舊 `ask`。
+
 ## 1. 背景
 
 目前 extension 的 follow-up 由 `subagent_control action=ask` 完成。它會將來源 run 的 task、final output 與部分 transcript 組成一個新 prompt，再交給一個使用 `--no-session` 啟動的新 child Pi process。

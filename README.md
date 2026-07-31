@@ -10,10 +10,10 @@ A Pi package for delegating work to isolated child Pi agents. It provides backgr
 - Process-wide FIFO queue with at most 4 child Pi processes running at once
 - Chained workflows with `{previous}` handoff and a cancellable parent run
 - Persisted child sessions and isolated continuation branches
-- `subagent_control` for list, status, stop, and delete
+- `subagent_control` for list, status, live guidance, stop, and delete
 - Session-scoped scheduled runs
 - Batched completion notifications delivered to the main session's next turn
-- Live viewer via `/subagent-view <runId>` or `&N` run references
+- Live viewer with streaming text/tool output and one-key guidance via `/subagent-view <runId>`
 - Bundled agents: `explorer`, `planner`, `reviewer`, and `worker`
 
 ## Install
@@ -55,6 +55,8 @@ Background run (default):
 ```
 
 The tool immediately returns a reference such as `&1`. The main agent remains available while the child runs.
+
+Open `/subagent-view &1` to watch it. While it is queued or running, press `i`, type a correction or additional instruction, and submit. No separate command syntax is required.
 
 Wait for the result when the current turn depends on it:
 
@@ -140,7 +142,7 @@ Omitting `agent` reuses the source agent. Supplying another agent changes the ro
 | Tool | Purpose |
 |---|---|
 | `subagent` | Start a fresh run, continuation, or chain. Background by default; supports `wait: true`. |
-| `subagent_control` | List, inspect, stop, or delete runs. |
+| `subagent_control` | List, inspect, guide, stop, or delete runs. |
 | `subagent_schedule` | Add, list, or delete session-scoped schedules. |
 
 | Command | Purpose |
@@ -156,9 +158,14 @@ Control examples:
 ```json
 { "action": "list" }
 { "action": "status", "runId": "&1" }
+{ "action": "send", "runId": "&1", "message": "Check the error path before editing" }
 { "action": "stop", "runId": "&1" }
 { "action": "delete", "runId": "&1" }
 ```
+
+`send` defaults to live steering: Pi delivers the instruction at the next safe turn boundary, after the current tool batch. This does not terminate an active shell command. Set `"delivery": "followUp"` only when the instruction should wait until the subagent finishes its current work. Sending to a running chain parent automatically targets its active child.
+
+Once a run is closed, use `subagent({ continueFrom: "&1", task: "..." })` instead.
 
 ## Completion delivery
 

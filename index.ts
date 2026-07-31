@@ -1,7 +1,7 @@
 /**
  * Subagent Tool - delegate tasks to specialized pi agents with isolated context.
  *
- * Each invocation spawns one or more separate persisted `pi --mode json -p`
+ * Each invocation spawns one or more separate persisted `pi --mode rpc`
  * sessions. Child context stays isolated; background runs publish through the
  * run store/viewer, while wait=true can stream progress in the tool result.
  */
@@ -266,12 +266,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("subagent-view", {
-		description: "Open a live subagent run viewer: /subagent-view <runId>",
+		description: "Watch a subagent and press i to guide it: /subagent-view <runId>",
 		getArgumentCompletions: (prefix) => getRunRefCompletions(prefix.replace(/^[&＆]/, "")),
 		handler: async (args, ctx) => {
 			const run = subagentManager.findRun(args.trim());
 			if (!run) return ctx.ui.notify(`Unknown subagent run: ${args.trim() || "(missing)"}`, "warning");
-			openSubagentRunViewer(ctx, run.id, run.ownerSessionId);
+			openSubagentRunViewer(ctx, run.id, run.ownerSessionId, (targetRunId, message) => subagentManager.sendRunInput(targetRunId, message));
 		},
 	});
 
@@ -617,7 +617,7 @@ export default function (pi: ExtensionAPI) {
 					completionNotifier.watch(handle.run, handle.completion);
 					const id = formatShortRunId(handle.run.id);
 					return {
-						content: [{ type: "text", text: `Started chain ${id} in background. Use subagent_control with runId ${id} to inspect or stop it.` }],
+						content: [{ type: "text", text: `Started chain ${id} in background. Use subagent_control with runId ${id} to inspect, guide, or stop it.` }],
 						details: { ...makeDetailsFromParent("chain")([{
 							runId: handle.run.id,
 							agent: handle.run.agent,
@@ -651,7 +651,7 @@ export default function (pi: ExtensionAPI) {
 				if (!params.wait) {
 					const id = formatShortRunId(started.run.id);
 					return {
-						content: [{ type: "text", text: `Started ${started.run.agent} ${id} in background. Use subagent_control with runId ${id} to inspect or stop it.` }],
+						content: [{ type: "text", text: `Started ${started.run.agent} ${id} in background. Use subagent_control with runId ${id} to inspect, guide, or stop it.` }],
 						details: makeDetailsFromParent("single")([{
 							runId: started.run.id,
 							agent: started.run.agent,
