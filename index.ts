@@ -17,6 +17,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList, getAgentModelDefaults, setAgentModelDefault } from "./agents.ts";
+import { SUBAGENT_STATUS_KEY, SUBAGENT_WIDGET_KEY, SubagentStatusWidget } from "./agents-widget.ts";
 import { startChain } from "./chain-runner.ts";
 import { CompletionNotifier } from "./completion-notifier.ts";
 import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
@@ -195,6 +196,28 @@ function formatRunList(runs: readonly SubagentRun[]): string {
 
 const subagentSchedulerController = new SubagentSchedulerController();
 
+function clearSubagentStatusPanel(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui" || !ctx.hasUI) return;
+	ctx.ui.setWidget(SUBAGENT_WIDGET_KEY, undefined);
+	ctx.ui.setStatus(SUBAGENT_STATUS_KEY, undefined);
+}
+
+function installSubagentStatusPanel(ctx: ExtensionContext, ownerSessionId: string): void {
+	if (ctx.mode !== "tui" || !ctx.hasUI) return;
+	clearSubagentStatusPanel(ctx);
+	ctx.ui.setWidget(
+		SUBAGENT_WIDGET_KEY,
+		(tui, theme) => new SubagentStatusWidget(tui, theme, ownerSessionId, subagentRunStore, (count) => {
+			const label = count === 1 ? "agent" : "agents";
+			ctx.ui.setStatus(
+				SUBAGENT_STATUS_KEY,
+				count > 0 ? ctx.ui.theme.fg("accent", `● ${count} ${label}`) : undefined,
+			);
+		}),
+		{ placement: "aboveEditor" },
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	let sessionCwd = process.cwd();
 	const runPointers = new RunPointerPersistence(pi);
@@ -226,6 +249,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		completionNotifier.activate(ownerSessionId, ctx);
 		completionNotifier.resume(subagentRunStore.getSnapshot(ownerSessionId));
+		installSubagentStatusPanel(ctx, ownerSessionId);
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
@@ -250,6 +274,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const ownerSessionId = getMainSessionOwnerId(ctx);
+		clearSubagentStatusPanel(ctx);
 		// Runtime-aborted work must not reappear as a user-facing completion after
 		// reload. Already-terminal pending notifications remain resumable.
 		for (const run of subagentRunStore.getSnapshot(ownerSessionId)) {

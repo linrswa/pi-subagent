@@ -1,7 +1,7 @@
 {
   "name": "pi-subagent",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Background-first subagents with isolated Pi sessions, continuations, chains, scheduling, and cancellation",
   "type": "module",
   "license": "MIT",

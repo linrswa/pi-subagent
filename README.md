@@ -13,6 +13,7 @@ A Pi package for delegating work to isolated child Pi agents. It provides backgr
 - `subagent_control` for list, status, live guidance, stop, and delete
 - Session-scoped scheduled runs
 - Batched completion notifications delivered to the main session's next turn
+- Persistent Agents widget and footer count while runs are queued or running
 - Live viewer with streaming text/tool output and one-key guidance via `/subagent-view <runId>`
 - Bundled agents: `explorer`, `planner`, `reviewer`, and `worker`
 
@@ -21,13 +22,13 @@ A Pi package for delegating work to isolated child Pi agents. It provides backgr
 Install the pinned GitHub release:
 
 ```bash
-pi install git:github.com/linrswa/pi-subagent@v0.1.0
+pi install git:github.com/linrswa/pi-subagent@v0.2.0
 ```
 
 Try it for one Pi session without changing settings:
 
 ```bash
-pi -e git:github.com/linrswa/pi-subagent@v0.1.0
+pi -e git:github.com/linrswa/pi-subagent@v0.2.0
 ```
 
 Pi clones the tagged repository and runs `npm install` automatically because the package has runtime dependencies.
@@ -54,7 +55,7 @@ Background run (default):
 }
 ```
 
-The tool immediately returns a reference such as `&1`. The main agent remains available while the child runs.
+The tool immediately returns a reference such as `&1`. The main agent remains available while the child runs. In TUI mode, an Agents widget stays above the editor and shows each active run's id, role, status, elapsed time, and current activity; the footer also shows the active count. Both hide automatically when no runs are queued or running.
 
 Open `/subagent-view &1` to watch it. While it is queued or running, press `i`, type a correction or additional instruction, and submit. No separate command syntax is required.
 
