@@ -137,12 +137,14 @@ export async function assertManagedChildSessionPath(sessionFile: string): Promis
  * SessionManager performs the header/cwd validation rather than this helper
  * parsing JSONL itself.
  */
-/** Read the active branch of a completed child session for UI display only. */
-export async function readChildSessionMessages(sessionFile: string, leafId?: string): Promise<import("./types.ts").AgentMessage[]> {
+/** Read a child branch; afterLeafId limits result extraction to this continuation. */
+export async function readChildSessionMessages(sessionFile: string, leafId?: string, afterLeafId?: string): Promise<import("./types.ts").AgentMessage[]> {
 	const managedFile = await assertManagedChildSessionPath(sessionFile);
 	const manager = SessionManager.open(managedFile, path.dirname(managedFile));
-	return manager
-		.getBranch(leafId)
+	const branch = manager.getBranch(leafId);
+	const boundary = afterLeafId ? branch.findIndex((entry) => entry.id === afterLeafId) : -1;
+	if (afterLeafId && boundary < 0) throw new Error("Continuation result boundary is missing; refusing to reuse an inherited answer");
+	return branch.slice(boundary + 1)
 		.filter((entry) => entry.type === "message")
 		.map((entry) => {
 			const message = (entry as unknown as { message: { content?: unknown; [key: string]: unknown } }).message;
@@ -185,9 +187,8 @@ async function assertManagedChildSessionDir(sessionDir: string): Promise<void> {
 
 /**
  * Copy the active path ending at leafId into an independent session file.
- * SessionManager writes a branch immediately only when its path includes an
- * assistant message. A user-only path is deferred until a later assistant
- * response, which this helper cannot safely resume, so it is rejected.
+ * Pi 1.3 persists even user-only branches immediately. Verify the new file
+ * exists before spawning, rather than assuming a particular history shape.
  */
 export async function branchChildSession(source: Required<Pick<ChildSessionRef, "sessionFile" | "leafId">> & Partial<ChildSessionRef>): Promise<ChildSessionRef> {
 	const sessionFile = await assertManagedChildSessionPath(source.sessionFile);
@@ -201,7 +202,7 @@ export async function branchChildSession(source: Required<Pick<ChildSessionRef, 
 		await fs.access(managedBranchedFile);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			throw new Error("Unable to create a persisted child session branch: the selected path has no assistant message");
+			throw new Error("Unable to create a persisted child session branch: the new branch file is missing");
 		}
 		throw error;
 	}

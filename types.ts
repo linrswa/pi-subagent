@@ -45,6 +45,8 @@ export interface SubagentRun {
 	agent: string;
 	agentSource: AgentSource | "unknown";
 	task: string;
+	/** Optional stable todo id; execution completion never completes the todo automatically. */
+	taskId?: string;
 	status: RunStatus;
 	startedAt: number;
 	endedAt?: number;
@@ -152,6 +154,8 @@ export type TaskItem = {
 
 export type SubagentParamsInput = {
 	agent?: string;
+	/** Optional stable task id from todo_write. */
+	taskId?: string;
 	/** Completed source run reference: subagent-3, &3, or 3. */
 	continueFrom?: string;
 	task?: string;
@@ -210,5 +214,5 @@ export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; n
 export type SubagentRunSubscriber = (runs: readonly SubagentRun[]) => void;
 export type CreateSubagentRunInput = Pick<SubagentRun, "mode" | "agent" | "agentSource" | "task"> &
 	/** Omitted only for legacy/runtime callers; store assigns its active runtime owner. */
-	Partial<Pick<SubagentRun, "ownerSessionId" | "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId" | "parentRunId" | "childRunIds" | "completionNotification">>;
+	Partial<Pick<SubagentRun, "ownerSessionId" | "step" | "cwd" | "model" | "agentScope" | "sessionId" | "sessionDir" | "sessionFile" | "leafId" | "continuedFromRunId" | "continuedFromLeafId" | "parentRunId" | "childRunIds" | "completionNotification" | "taskId">>;
 export type SubagentRunPatch = Partial<Omit<SubagentRun, "id">>;

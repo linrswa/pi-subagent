@@ -12,23 +12,26 @@ A Pi package for delegating work to isolated child Pi agents. It provides backgr
 - Persisted child sessions and isolated continuation branches
 - `subagent_control` for list, status, live guidance, stop, and delete
 - Session-scoped scheduled runs
-- Batched completion notifications delivered to the main session's next turn
+- Batched completion messages that wake an idle parent or queue behind its current work
+- Optional stable todo links and a versioned progress event bus
 - Persistent Agents widget and footer count while runs are queued or running
 - Live viewer with streaming text/tool output and one-key guidance via `/subagent-view <runId>`
 - Bundled agents: `explorer`, `planner`, `reviewer`, and `worker`
 
 ## Install
 
-Install the pinned GitHub release:
+Requires **Pi 1.3.0 or newer**. Install the current GitHub version:
 
 ```bash
-pi install git:github.com/linrswa/pi-subagent@v0.2.0
+pi install git:github.com/linrswa/pi-subagent
 ```
+
+For a reproducible installation, append a published tag or commit with `@<ref>`.
 
 Try it for one Pi session without changing settings:
 
 ```bash
-pi -e git:github.com/linrswa/pi-subagent@v0.2.0
+pi -e git:github.com/linrswa/pi-subagent
 ```
 
 Pi clones the tagged repository and runs `npm install` automatically because the package has runtime dependencies.
@@ -170,9 +173,27 @@ Once a run is closed, use `subagent({ continueFrom: "&1", task: "..." })` instea
 
 ## Completion delivery
 
-Background terminal events are debounced and grouped for the UI. A bounded completion summary remains durably marked as pending in the main-session run pointer. On the next normal user input, the extension appends all pending summaries to that turn; it marks them delivered only when Pi accepts the prompt and starts the parent agent. This avoids unsolicited automatic turns and prevents an in-memory notification queue from being lost on reload.
+Background terminal events are debounced into bounded custom messages. An idle parent starts a result-review turn automatically; a busy parent receives a `followUp` after its current work. **No new user input is required, and results are never appended to user text.** The main agent remains responsible for the primary task and delegates independent work only when useful.
 
-Full child transcripts stay in managed child-session files. Parent context receives only bounded completion summaries and run metadata.
+A run stays durably `pending` until the completion message is present in the session history. Receipts are acknowledged at post-persistence lifecycle boundaries, not on `agent_start` or the pre-persistence `message_end` hook. Reload replays receipts to avoid duplicate wake-ups; messages queued but not persisted remain retryable. Failed delivery is not retried in an automatic model loop.
+
+Pressing Escape to abort the parent pauses automatic wake-ups, including across reload. A deliberate user-started run resumes delivery. Navigating the session tree also pauses automatic delivery so an old task does not silently restart on a different branch. Session shutdown stops owned child work. Print/JSON one-shot callers should use `wait: true`; background operation requires a live parent process.
+
+**Delivered is not reviewed, and execution completed is not task success.** The parent must inspect evidence, update the appropriate todo, and report or continue only within existing authorization. Aborted work must not be restarted automatically. Automatic result-review turns consume model usage.
+
+Full child transcripts stay in managed child-session files. Parent context receives bounded summaries; `subagent_control status` lazily loads the full final answer after reload (with a 51,200-character safety limit and a session-file reference for larger results). Model/usage/error metadata is retained in pointers.
+
+## Todo integration (optional)
+
+When `pi-plan-tracker` is installed, `subagent` accepts an optional `taskId` from `todo_write`. Without it, the sole in-progress todo is selected when available. A continuation can retain its source task link. Run status is displayed alongside the checklist but **never automatically marks a todo complete**.
+
+The packages communicate through `pi.events`, not private stores:
+
+- `pi-plan:context-request`: `{ ownerSessionId, respond({ readOnly, taskId? }) }`.
+- `pi-subagent:state`: `{ version: 1, ownerSessionId, runs: [{ id, task, taskId?, status, completionNotification? }] }`.
+- `pi-subagent:snapshot-request`: `{ ownerSessionId, respond(snapshot) }` for initial/reloaded UI.
+
+Snapshots are session-scoped, contain no transcript, and are emitted only for meaningful metadata changes. Stable task IDs keep old results from modifying a new checklist. The plan extension owns read-only policy and disallows new delegation while enforced plan mode is active.
 
 ## Child session retention and scope
 
@@ -251,10 +272,12 @@ The current implementation isolates process context and Pi session history, but 
 ## Development
 
 ```bash
-npm install
+npm install --ignore-scripts
 npm run check
 npm test
 ```
+
+The test suite includes real Pi 1.3 session/lifecycle tests with a synthetic provider (no network/model usage), protocol-shaped RPC tests, cancellation/scheduler races, and receipt replay. Runtime compatibility is checked against Pi 1.3 rather than relying on legacy RPC fixtures.
 
 ## License
 

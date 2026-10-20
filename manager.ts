@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSettings, formatAgentList } from "./agents.ts";
 import { MAX_AGENT_SUGGESTIONS } from "./constants.ts";
-import { cleanupChildSession, getChildSessionOwnerId } from "./child-sessions.ts";
+import { cleanupChildSession, getChildSessionOwnerId, readChildSessionMessages } from "./child-sessions.ts";
 import { getFinalOutput, toParentResult } from "./results.ts";
 import { runSingleAgent } from "./runner.ts";
 import { OwnerRunLifecycle } from "./run-lifecycle.ts";
@@ -124,6 +124,25 @@ export function createRunRefAutocompleteProvider(current: AutocompleteProvider):
 	};
 }
 
+/** Reloaded pointers retain a short preview; fetch only the final answer on demand. */
+export async function loadRunDetails(run: SubagentRun): Promise<string> {
+	if (run.status === "queued" || run.status === "running" || run.messages.length > 0) return formatRunDetails(run);
+	const source = run.sessionFile ? run : run.childRunIds?.length
+		? subagentRunStore.get(run.childRunIds.at(-1)!, run.ownerSessionId) : undefined;
+	if (!source?.sessionFile) return formatRunDetails(run);
+	try {
+		if (source.continuedFromRunId && !source.continuedFromLeafId) throw new Error("Continuation result boundary is unavailable; only the saved summary can be shown");
+		const messages = await readChildSessionMessages(source.sessionFile, source.leafId, source.continuedFromLeafId);
+		const output = getFinalOutput(messages);
+		const limit = 50 * 1024;
+		const finalOutput = output.length > limit
+			? `${output.slice(0, limit)}\n[Output truncated; full answer remains in ${source.sessionFile}]` : output;
+		return formatRunDetails({ ...run, finalOutput: finalOutput || run.finalOutput });
+	} catch (error) {
+		return `${formatRunDetails(run)}\nFull result could not be loaded: ${error instanceof Error ? error.message : String(error)}`;
+	}
+}
+
 export function formatRunDetails(run: SubagentRun): string {
 	const output = run.finalOutput || getFinalOutput(run.messages);
 	const usage = [
@@ -138,6 +157,7 @@ export function formatRunDetails(run: SubagentRun): string {
 		`agent: ${run.agent}`,
 		`source: ${run.agentSource}`,
 		`task: ${run.task || "(none)"}`,
+		`task id: ${run.taskId ?? "(unlinked)"}`,
 		`cwd: ${run.cwd ?? "(none)"}`,
 		`current tool: ${run.currentTool ?? "(none)"}`,
 		`live output: ${run.liveToolOutput || run.liveMessage ? compactPreview(run.liveToolOutput || run.liveMessage, 300) : "(none)"}`,
@@ -193,6 +213,7 @@ export async function confirmProjectAgentIfNeeded(
 
 export interface StartAgentParams {
 	task?: string;
+	taskId?: string;
 	agent?: string;
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
@@ -207,6 +228,12 @@ export interface StartAgentParams {
 /** Start one managed child run and return its handle without awaiting completion. */
 export async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: StartAgentParams, lifecycle?: OwnerRunLifecycle): Promise<StartedAgentRun> {
 	const ownerSessionId = getMainSessionOwnerId(ctx);
+	const isReadOnly = () => {
+		let readOnly = false;
+		pi.events?.emit("pi-plan:context-request", { ownerSessionId, respond: (state: { readOnly?: boolean }) => { readOnly ||= state?.readOnly === true; } });
+		return readOnly;
+	};
+	if (isReadOnly()) return { ok: false, message: "Plan mode: new subagents are disabled. Leave plan mode before starting work." };
 	// Capture the runtime signal before any interactive confirmation can await.
 	// A shutdown during confirmation must not recreate a fresh owner controller.
 	const runSignal = lifecycle?.signalFor(ownerSessionId, params.signal) ?? params.signal;
@@ -227,6 +254,7 @@ export async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params
 
 	const ok = await confirmProjectAgentIfNeeded(ctx, discovery, agent, params.confirmProjectAgents ?? true);
 	if (!ok) return { ok: false, message: "Canceled: project-local agent not approved." };
+	if (isReadOnly()) return { ok: false, message: "Plan mode: subagent launch cancelled while approval was pending." };
 	if (runSignal?.aborted) return { ok: false, message: "Canceled: session is shutting down." };
 
 	const fallbackModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -260,8 +288,8 @@ export async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params
 		onUpdate: params.onUpdate,
 		makeDetails,
 		onRunCreated: (run) => {
-			createdRun = run;
-			lifecycle?.track(run);
+			createdRun = params.taskId ? subagentRunStore.update(run.id, { taskId: params.taskId }, run.ownerSessionId) ?? run : run;
+			lifecycle?.track(createdRun);
 		},
 	});
 

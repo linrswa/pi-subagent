@@ -9,7 +9,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, VERSION } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	Markdown,
@@ -20,11 +20,12 @@ import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsWithSe
 import { SUBAGENT_STATUS_KEY, SUBAGENT_WIDGET_KEY, SubagentStatusWidget } from "./agents-widget.ts";
 import { startChain } from "./chain-runner.ts";
 import { CompletionNotifier } from "./completion-notifier.ts";
+import { SubagentPlanBridge } from "./plan-bridge.ts";
 import { getFinalOutput, getResultOutput, isFailedResult, toParentResult } from "./results.ts";
 import {
 	SubagentManager,
 	buildRunRefContext,
-	formatRunDetails,
+	loadRunDetails,
 	createRunRefAutocompleteProvider,
 	getAgentCommandCompletions,
 	getMainSessionOwnerId,
@@ -219,22 +220,30 @@ function installSubagentStatusPanel(ctx: ExtensionContext, ownerSessionId: strin
 }
 
 export default function (pi: ExtensionAPI) {
+	const [major, minor] = VERSION.split(".").map(Number);
+	if (major < 1 || (major === 1 && minor < 3)) throw new Error("pi-subagent requires Pi 1.3.0 or newer (RPC settlement and delta protocol).");
 	let sessionCwd = process.cwd();
 	const runPointers = new RunPointerPersistence(pi);
 	const runLifecycle = new OwnerRunLifecycle();
-	const completionNotifier = new CompletionNotifier();
+	const completionNotifier = new CompletionNotifier(pi);
+	const planBridge = new SubagentPlanBridge(pi);
 	const subagentManager = new SubagentManager(
 		pi,
-		(run) => runPointers.tombstone(run.ownerSessionId, run.id),
+		(run) => { runPointers.tombstone(run.ownerSessionId, run.id); planBridge.remove(run); },
 		runLifecycle,
 		subagentRunStore,
 		(run, completion) => completionNotifier.watch(run, completion),
 	);
 	// One observer sees all scopes. RunPointerPersistence rejects completions from
 	// background runs once their captured main-session generation is no longer active.
-	subagentRunStore.subscribeChanges((run) => runPointers.record(run));
+	let unsubscribeStore: (() => void) | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		unsubscribeStore ??= subagentRunStore.subscribeChanges((run) => {
+			runPointers.record(run);
+			planBridge.record(run);
+			if (run.endedAt !== undefined && !run.abort) completionNotifier.resume();
+		});
 		sessionCwd = ctx.cwd;
 		const ownerSessionId = getMainSessionOwnerId(ctx);
 		subagentRunStore.setActiveOwner(ownerSessionId);
@@ -247,30 +256,38 @@ export default function (pi: ExtensionAPI) {
 			// Ephemeral/no-session parents still retain their in-process run scope.
 			runPointers.activate(ownerSessionId, [], subagentRunStore);
 		}
-		completionNotifier.activate(ownerSessionId, ctx);
-		completionNotifier.resume(subagentRunStore.getSnapshot(ownerSessionId));
+		let entries: ReturnType<typeof ctx.sessionManager.getEntries> = [];
+		try { entries = ctx.sessionManager.getEntries(); } catch { /* ephemeral session */ }
+		for (const run of completionNotifier.activate(ownerSessionId, ctx, entries)) runPointers.recordCurrent(run);
+		planBridge.activate(ownerSessionId, subagentRunStore.getSnapshot(ownerSessionId));
+		completionNotifier.resume();
 		installSubagentStatusPanel(ctx, ownerSessionId);
 		void subagentSchedulerController.start(subagentManager, ctx);
 		if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => createRunRefAutocompleteProvider(current));
 	});
 
 	pi.on("input", (event) => {
-		// Steering/follow-up messages do not start a new agent run, and slash
-		// templates expand after this hook. Leave completions pending for the next
-		// ordinary idle prompt instead of duplicating or corrupting template args.
-		if (event.source === "extension" || event.streamingBehavior || event.text.trimStart().startsWith("/")) return { action: "continue" };
-		const ownerSessionId = subagentRunStore.getActiveOwner();
-		const completion = completionNotifier.stageForNextInput(ownerSessionId);
+		// Only explicit run references are expanded. Completion delivery never
+		// attaches child results to a user's text or waits for another prompt.
+		if (event.source === "extension" || event.text.trimStart().startsWith("/")) return { action: "continue" };
 		const runRefContext = buildRunRefContext(event.text);
-		const additions = [completion.content, runRefContext].filter((value): value is string => Boolean(value));
-		if (additions.length === 0) return { action: "continue" };
-		return { action: "transform", text: `${event.text}\n\n${additions.join("\n\n")}` };
+		return runRefContext ? { action: "transform", text: `${event.text}\n\n${runRefContext}` } : { action: "continue" };
 	});
 
-	pi.on("agent_start", (_event, ctx) => {
-		const ownerSessionId = getMainSessionOwnerId(ctx);
-		for (const run of completionNotifier.acknowledgeStaged(ownerSessionId)) runPointers.recordCurrent(run);
+	pi.on("before_agent_start", (event) => {
+		if (event.messageType === "user") completionNotifier.resumeAfterUserInput();
 	});
+	const acknowledgePersistedCompletions = (ctx: ExtensionContext) => {
+		for (const run of completionNotifier.acknowledgePersisted(ctx.sessionManager.getEntries())) runPointers.recordCurrent(run);
+	};
+	pi.on("turn_end", (_event, ctx) => acknowledgePersistedCompletions(ctx));
+	pi.on("agent_before_settle", (_event, ctx) => acknowledgePersistedCompletions(ctx));
+	pi.on("agent_settled", (event) => {
+		if (event.aborted) completionNotifier.pause();
+	});
+	// Pause before asynchronous branch summarization starts, not after navigation.
+	pi.on("session_before_tree", () => completionNotifier.pause());
+	pi.on("session_tree", () => completionNotifier.pause());
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const ownerSessionId = getMainSessionOwnerId(ctx);
@@ -283,11 +300,14 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		completionNotifier.deactivate(ownerSessionId);
+		planBridge.deactivate();
 		// Stop timers first. Keep pointer persistence active while runtime-owned
 		// children receive aborts and publish their terminal records.
 		subagentSchedulerController.stop();
 		await runLifecycle.shutdown(ownerSessionId);
 		runPointers.deactivate();
+		unsubscribeStore?.();
+		unsubscribeStore = undefined;
 	});
 
 	pi.registerCommand("subagent-view", {
@@ -387,7 +407,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (action === "status") {
-				return { content: [{ type: "text", text: formatRunDetails(run) }], details: { action, runId: run.id } };
+				return { content: [{ type: "text", text: await loadRunDetails(run) }], details: { action, runId: run.id } };
 			}
 
 			if (action === "send") {
@@ -492,8 +512,9 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		promptSnippet: "Start a focused child agent in background and return its run id; set wait=true only when the current turn needs the final result. Multiple sibling calls run concurrently.",
 		promptGuidelines: [
-			"Use subagent for focused codebase reconnaissance, implementation planning, or independent code review when isolation helps.",
-			"Runs are background by default. Do not poll; completion is delivered to the main session. Set wait=true only when the current turn cannot continue without the result.",
+			"Keep primary work in the main agent. Delegate independent parallel work or focused reconnaissance/review when isolation helps; do not hand off the entire task by default.",
+			"Runs are background by default. Do not poll; completion actively queues a follow-up and wakes an idle main agent. Set wait=true only when the current turn cannot continue without the result.",
+			"On completion, inspect the result, verify the requested outcome, update the relevant todo, and report or continue within the user's authorization. Run completion is not proof of task success. Use taskId to link a specific todo when needed.",
 			"For parallel work, emit multiple sibling subagent calls; Pi executes sibling tools concurrently. Avoid concurrent agents that edit the same files.",
 			"Use subagent chain mode with {previous} to pass explorer findings to planner or reviewer output to worker.",
 			"Continue a completed run with {continueFrom: \"&1\", task: \"...\"}; omit agent to reuse it, or provide agent to switch. Continuations retain the source cwd.",
@@ -504,6 +525,7 @@ export default function (pi: ExtensionAPI) {
 			const params = rawParams as SubagentParamsInput;
 			const mode = getMode(params);
 			const sourceRun = params.continueFrom ? subagentManager.findRun(params.continueFrom) : undefined;
+			const taskId = params.taskId ?? planBridge.currentTaskId(getMainSessionOwnerId(ctx)) ?? sourceRun?.taskId;
 			// Capture before any project-agent confirmation can await. If the session
 			// shuts down during confirmation, this signal remains aborted.
 			const chainOwnerSessionId = mode === "chain" ? getMainSessionOwnerId(ctx) : undefined;
@@ -634,7 +656,10 @@ export default function (pi: ExtensionAPI) {
 					signal: chainSignal,
 					onUpdate: params.wait ? (onUpdate as OnUpdateCallback | undefined) : undefined,
 					makeDetails: makeDetails("chain"),
-					onParentCreated: (run) => runLifecycle.track(run),
+					onParentCreated: (run) => {
+						if (taskId) subagentRunStore.update(run.id, { taskId }, run.ownerSessionId);
+						runLifecycle.track(run);
+					},
 					onChildCreated: (run) => runLifecycle.track(run),
 				});
 
@@ -663,6 +688,7 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "single" && params.task) {
 				const started = await subagentManager.startAgent(ctx, {
 					task: params.task,
+					taskId,
 					agent: params.agent,
 					agentScope,
 					confirmProjectAgents,

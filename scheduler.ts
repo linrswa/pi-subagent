@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -150,8 +150,13 @@ export class SubagentSchedulerController {
 	private filePath: string | undefined;
 	private startPromise: Promise<boolean> | null = null;
 	private generation = 0;
+	/** Only successfully persisted jobs may enter this map or be launched. */
 	private readonly jobs = new Map<string, SubagentScheduleJob>();
+	private readonly pendingAdds = new Map<string, { job: SubagentScheduleJob; cancelled: boolean }>();
+	private readonly pendingDeletes = new Map<string, object>();
+	private readonly firing = new Map<string, SubagentScheduleJob>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly deadlines = new Map<string, number>();
 
 	async start(manager: SubagentManager, ctx: ExtensionContext): Promise<boolean> {
 		this.stop();
@@ -163,7 +168,7 @@ export class SubagentSchedulerController {
 		this.filePath = filePath;
 		this.startPromise = (async () => {
 			const jobs = await this.load(filePath);
-			if (this.generation !== generation) return false;
+			if (!this.isCurrentSession(generation, filePath)) return false;
 			this.jobs.clear();
 			for (const [id, job] of jobs) this.jobs.set(id, job);
 			for (const job of this.jobs.values()) this.arm(job);
@@ -180,7 +185,11 @@ export class SubagentSchedulerController {
 		this.generation++;
 		for (const timer of this.timers.values()) clearTimeout(timer);
 		this.timers.clear();
+		this.deadlines.clear();
 		this.jobs.clear();
+		this.pendingAdds.clear();
+		this.pendingDeletes.clear();
+		this.firing.clear();
 		this.manager = null;
 		this.ctx = null;
 		this.filePath = undefined;
@@ -188,15 +197,31 @@ export class SubagentSchedulerController {
 	}
 
 	async ensure(manager: SubagentManager, ctx: ExtensionContext): Promise<boolean> {
-		if (this.startPromise) return this.startPromise;
-		return this.filePath ? true : this.start(manager, ctx);
+		if (this.filePath === getScheduleStoragePath(ctx) && this.manager === manager) return this.startPromise ?? true;
+		return this.start(manager, ctx);
+	}
+
+	private isCurrentSession(generation: number, filePath = this.filePath): boolean {
+		return this.generation === generation && this.filePath === filePath && Boolean(this.ctx && filePath && getScheduleStoragePath(this.ctx) === filePath);
 	}
 
 	list(): SubagentScheduleJob[] {
-		return Array.from(this.jobs.values(), (job) => ({ ...job }));
+		// Pending additions stay visible/cancellable, but never enter another
+		// operation's persisted snapshot or acquire a timer before commit.
+		const jobs = new Map(this.jobs);
+		for (const { job, cancelled } of this.pendingAdds.values()) if (!cancelled && !jobs.has(job.id)) jobs.set(job.id, job);
+		return Array.from(jobs.values(), (job) => ({ ...job, nextRunAt: this.deadlines.get(job.id) ?? job.nextRunAt }));
 	}
 
 	async add(params: SubagentScheduleParamsInput): Promise<{ ok: true; job: SubagentScheduleJob } | { ok: false; message: string }> {
+		const generation = this.generation;
+		const ctx = this.ctx;
+		const filePath = this.filePath;
+		const isCurrent = () => this.ctx === ctx && this.isCurrentSession(generation, filePath);
+		const changed = { ok: false as const, message: "Schedule session changed before the add completed." };
+		if (!ctx || !filePath) return { ok: false, message: "Subagent scheduler is not started." };
+		if (this.startPromise) await this.startPromise;
+		if (!isCurrent()) return changed;
 		const schedule = params.schedule?.trim();
 		const prompt = params.prompt?.trim();
 		const name = params.name?.trim();
@@ -206,7 +231,8 @@ export class SubagentSchedulerController {
 		if (name && this.list().some((job) => job.id === name || formatScheduleId(job.id) === name)) return { ok: false, message: `Schedule id already exists: ${name}.` };
 		const parsed = parseSubagentSchedule(schedule);
 		if (parsed.ok === false) return { ok: false, message: parsed.message };
-		const approved = await this.confirmProjectAgent(params);
+		const approved = await this.confirmProjectAgent(params, ctx);
+		if (!isCurrent()) return changed;
 		if (approved !== true) return { ok: false, message: approved };
 
 		const job: SubagentScheduleJob = {
@@ -221,19 +247,35 @@ export class SubagentSchedulerController {
 			intervalMs: parsed.parsed.intervalMs,
 			nextRunAt: parsed.parsed.nextRunAt,
 		};
-		this.jobs.set(job.id, job);
-		try {
-			await this.save();
-		} catch (error) {
-			this.jobs.delete(job.id);
-			return { ok: false, message: `Failed to save schedule: ${error instanceof Error ? error.message : String(error)}` };
+		// Approval can yield, allowing another add to claim the same id.
+		if (this.pendingDeletes.has(job.id) || this.list().some((existing) => existing.id === job.id || formatScheduleId(existing.id) === formatScheduleId(job.id))) {
+			return { ok: false, message: `Schedule id already exists: ${job.id}.` };
 		}
-		this.arm(job);
-		return { ok: true, job: { ...job } };
+		const pending = { job, cancelled: false };
+		this.pendingAdds.set(job.id, pending);
+		try {
+			const committed = await this.mutate(generation, filePath, (jobs) => {
+				if (pending.cancelled) return undefined;
+				if ([...jobs.values()].some((existing) => formatScheduleId(existing.id) === formatScheduleId(job.id))) {
+					throw new Error(`Schedule id already exists: ${job.id}.`);
+				}
+				jobs.set(job.id, job);
+				return jobs;
+			}, () => !pending.cancelled, () => this.arm(job));
+			// Once rename commits, report success even if a later delete or
+			// session switch wins the race with this promise's continuation.
+			if (committed) return { ok: true, job: { ...job, nextRunAt: this.deadlines.get(job.id) ?? job.nextRunAt } };
+			if (!isCurrent()) return changed;
+			return { ok: false, message: "Schedule was removed before the add completed." };
+		} catch (error) {
+			if (!isCurrent()) return changed;
+			return { ok: false, message: `Failed to save schedule: ${error instanceof Error ? error.message : String(error)}` };
+		} finally {
+			if (this.pendingAdds.get(job.id) === pending) this.pendingAdds.delete(job.id);
+		}
 	}
 
-	private async confirmProjectAgent(params: SubagentScheduleParamsInput): Promise<true | string> {
-		const ctx = this.ctx;
+	private async confirmProjectAgent(params: SubagentScheduleParamsInput, ctx: ExtensionContext): Promise<true | string> {
 		const scope: AgentScope = params.agentScope ?? "user";
 		if (!ctx || scope === "user") return true;
 		const discovery = discoverAgents(ctx.cwd, scope);
@@ -247,36 +289,56 @@ export class SubagentSchedulerController {
 	}
 
 	async delete(ref: string | undefined): Promise<boolean> {
+		const generation = this.generation;
+		const filePath = this.filePath;
 		const job = findScheduleByRef(ref, this.list());
-		if (!job) return false;
+		if (!job || !filePath || !this.isCurrentSession(generation, filePath) || this.pendingDeletes.has(job.id)) return false;
+		const pending = this.pendingAdds.get(job.id);
+		if (pending) pending.cancelled = true;
+		const deletion = {};
+		this.pendingDeletes.set(job.id, deletion);
 		this.clearTimer(job.id);
-		const deleted = this.jobs.delete(job.id);
-		if (deleted) await this.save();
-		return deleted;
+		let committed = false;
+		try {
+			committed = await this.mutate(generation, filePath, (jobs) => {
+				jobs.delete(job.id);
+				return jobs;
+			});
+			return committed;
+		} finally {
+			if (this.pendingDeletes.get(job.id) === deletion) {
+				this.pendingDeletes.delete(job.id);
+				// A failed deletion leaves the durable job intact. Restore its
+				// timer rather than pretending it was deleted until the next reload.
+				const retained = this.jobs.get(job.id);
+				if (!committed && retained && !this.firing.has(job.id) && this.isCurrentSession(generation, filePath)) this.arm(retained);
+			}
+		}
 	}
 
 	private clearTimer(id: string): void {
 		const timer = this.timers.get(id);
 		if (timer) clearTimeout(timer);
 		this.timers.delete(id);
+		this.deadlines.delete(id);
 	}
 
 	private arm(job: SubagentScheduleJob): void {
+		if (!this.isCurrentSession(this.generation) || this.jobs.get(job.id) !== job || this.pendingDeletes.has(job.id)) return;
 		this.clearTimer(job.id);
 		const nextRunAt = this.nextRunAt(job);
 		if (!nextRunAt) {
-			this.jobs.delete(job.id);
-			void this.save().catch((error) => this.reportError("Failed to save schedules", error));
+			void this.delete(job.id).catch((error) => this.reportError("Failed to save schedules", error));
 			return;
 		}
-		job.nextRunAt = nextRunAt;
 		const delay = Math.max(0, Math.min(MAX_TIMER_DELAY_MS, nextRunAt - Date.now()));
 		const generation = this.generation;
 		const timer = setTimeout(() => {
-			void this.fire(job.id, generation).catch((error) => this.reportError("Scheduled subagent failed", error));
+			void this.fire(job.id, generation, nextRunAt).catch((error) => this.reportError("Scheduled subagent failed", error));
 		}, delay);
 		(timer as { unref?: () => void }).unref?.();
 		this.timers.set(job.id, timer);
+		this.deadlines.set(job.id, nextRunAt);
 	}
 
 	private nextRunAt(job: SubagentScheduleJob): number | undefined {
@@ -285,43 +347,56 @@ export class SubagentSchedulerController {
 		return job.nextRunAt;
 	}
 
-	private async fire(id: string, generation: number): Promise<void> {
+	private async fire(id: string, generation: number, scheduledAt?: number): Promise<void> {
 		const job = this.jobs.get(id);
 		const ctx = this.ctx;
 		const manager = this.manager;
-		if (!job || !ctx || !manager || this.generation !== generation) return;
-		if ((job.nextRunAt ?? 0) - Date.now() > 1000) return this.arm(job);
+		const filePath = this.filePath;
+		if (!job || !ctx || !manager || !filePath || !this.isCurrentSession(generation) || this.pendingDeletes.has(id) || this.firing.has(id)) return;
+		if ((scheduledAt ?? job.nextRunAt ?? 0) - Date.now() > 1000) return this.arm(job);
 
-		job.lastRunAt = Date.now();
-		const result = await manager.startAgent(ctx, {
-			task: job.prompt,
-			agent: job.agent,
-			agentScope: job.agentScope,
-			confirmProjectAgents: false,
-			cwd: job.cwd,
-		});
-		if (this.generation !== generation || this.jobs.get(id) !== job || this.ctx !== ctx || this.manager !== manager) return;
-		if (result.ok === true) {
-			job.lastRunId = result.run.id;
-			ctx.ui.notify(`Schedule ${formatScheduleId(job.id)} started ${formatShortRunId(result.run.id)}.`, "info");
-		} else {
-			ctx.ui.notify(`Schedule ${formatScheduleId(job.id)} failed: ${result.message}`, "error");
+		this.clearTimer(id);
+		this.firing.set(id, job);
+		const lastRunAt = Date.now();
+		try {
+			const result = await manager.startAgent(ctx, {
+				task: job.prompt,
+				agent: job.agent,
+				agentScope: job.agentScope,
+				confirmProjectAgents: false,
+				cwd: job.cwd,
+			});
+			const isCurrent = () => this.isCurrentSession(generation, filePath) && this.jobs.get(id) === job && this.ctx === ctx && this.manager === manager;
+			if (!isCurrent()) return;
+			if (result.ok === true) {
+				ctx.ui.notify(`Schedule ${formatScheduleId(job.id)} started ${formatShortRunId(result.run.id)}.`, "info");
+			} else {
+				ctx.ui.notify(`Schedule ${formatScheduleId(job.id)} failed: ${result.message}`, "error");
+			}
+			const next: SubagentScheduleJob = {
+				...job, lastRunAt, lastRunId: result.ok === true ? result.run.id : job.lastRunId,
+				nextRunAt: job.kind === "interval" ? Date.now() + (job.intervalMs ?? 0) : getCronNextRun(job.schedule),
+			};
+			const committed = await this.mutate(generation, filePath, (jobs) => {
+				if (!isCurrent() || this.pendingDeletes.has(id)) return undefined;
+				if (job.kind === "once" || !next.nextRunAt) jobs.delete(id);
+				else jobs.set(id, next);
+				return jobs;
+			}, () => !this.pendingDeletes.has(id), () => {
+				if (this.jobs.get(id) === next) this.arm(next);
+			});
+			// A queued delete may have failed while this firing was awaiting its
+			// turn. Only re-arm an unchanged committed job, never a deleted one.
+			if (!committed && isCurrent() && !this.pendingDeletes.has(id)) this.arm(job);
+		} finally {
+			if (this.firing.get(id) === job) this.firing.delete(id);
 		}
-
-		if (job.kind === "once") {
-			this.clearTimer(job.id);
-			this.jobs.delete(job.id);
-		} else {
-			job.nextRunAt = job.kind === "interval" ? Date.now() + (job.intervalMs ?? 0) : undefined;
-			this.arm(job);
-		}
-		await this.save();
 	}
 
 	private async load(filePath: string): Promise<Map<string, SubagentScheduleJob>> {
 		const loaded = new Map<string, SubagentScheduleJob>();
 		try {
-			const content = await fs.promises.readFile(filePath, "utf-8");
+			const content = await withFileMutationQueue(filePath, () => fs.promises.readFile(filePath, "utf-8"));
 			const data = JSON.parse(content) as { jobs?: unknown };
 			const jobs = Array.isArray(data.jobs) ? data.jobs : [];
 			for (const entry of jobs) {
@@ -352,17 +427,36 @@ export class SubagentSchedulerController {
 		return loaded;
 	}
 
-	private async save(): Promise<void> {
-		const filePath = this.filePath;
-		if (!filePath) return;
-		const generation = this.generation;
-		const jobs = Array.from(this.jobs.values()).sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
-		const content = `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`;
-		await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-		if (this.generation !== generation || this.filePath !== filePath) return;
-		await withFileMutationQueue(filePath, async () => {
-			if (this.generation !== generation || this.filePath !== filePath) return;
-			await fs.promises.writeFile(filePath, content, { encoding: "utf-8", mode: 0o600 });
+	/** Propose from committed state, persist atomically, then publish in memory. */
+	private async mutate(
+		generation: number,
+		filePath: string,
+		propose: (jobs: Map<string, SubagentScheduleJob>) => Map<string, SubagentScheduleJob> | undefined,
+		canCommit: () => boolean = () => true,
+		afterCommit: () => void = () => {},
+	): Promise<boolean> {
+		return withFileMutationQueue(filePath, async () => {
+			if (!this.isCurrentSession(generation, filePath)) return false;
+			await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+			if (!this.isCurrentSession(generation, filePath)) return false;
+			const next = propose(new Map(this.jobs));
+			if (!next) return false;
+			const jobs = [...next.values()].sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
+			const content = `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`;
+			const temporary = `${filePath}.${randomUUID()}.tmp`;
+			try {
+				await fs.promises.writeFile(temporary, content, { encoding: "utf-8", mode: 0o600 });
+				if (!this.isCurrentSession(generation, filePath) || !canCommit()) return false;
+				await fs.promises.rename(temporary, filePath);
+				if (this.isCurrentSession(generation, filePath)) {
+					this.jobs.clear();
+					for (const [id, job] of next) this.jobs.set(id, job);
+					afterCommit();
+				}
+				return true;
+			} finally {
+				await fs.promises.rm(temporary, { force: true }).catch(() => {});
+			}
 		});
 	}
 

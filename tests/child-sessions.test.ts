@@ -105,7 +105,7 @@ test("sibling branches preserve the source and contain its active path", async (
 	}
 });
 
-test("branching a user-only leaf rejects instead of opening Pi's deferred branch file", async () => {
+test("Pi 1.3 persists an isolated user-only branch without copying abandoned sibling answers", async () => {
 	const owner = ownerId();
 	try {
 		const cwd = process.cwd();
@@ -126,10 +126,12 @@ test("branching a user-only leaf rejects instead of opening Pi's deferred branch
 		const sessionFile = manager.getSessionFile();
 		assert.ok(sessionFile);
 
-		await assert.rejects(
-			branchChildSession({ sessionFile, leafId: userOnlyLeaf }),
-			/no assistant message/,
-		);
+		const before = await readFile(sessionFile, "utf8");
+		const branched = await branchChildSession({ sessionFile, leafId: userOnlyLeaf });
+		assert.notEqual(branched.sessionFile, sessionFile);
+		const context = SessionManager.open(branched.sessionFile!).buildSessionContext();
+		assert.deepEqual(context.messages.map((message) => typeof message.content === "string" ? message.content : ""), ["root question", "branch question"]);
+		assert.equal(await readFile(sessionFile, "utf8"), before);
 	} finally {
 		await rm(path.join(getChildSessionsRoot(), owner), { recursive: true, force: true });
 	}

@@ -13,6 +13,7 @@ test("extension public run visibility follows the active persisted Pi session", 
 	const tools = new Map<string, any>();
 	const entries = new Map<string, any[]>();
 	const autocompleteProviders: any[] = [];
+	const delivered: any[] = [];
 	let activeSessionId = "";
 	const suffix = `${process.pid}-${Date.now()}`;
 	const sessionA = `main-A-${suffix}`;
@@ -26,6 +27,11 @@ test("extension public run visibility follows the active persisted Pi session", 
 			entries.get(activeSessionId)!.push({ type: "custom", customType, data });
 		},
 		getThinkingLevel() { return undefined; },
+		sendMessage(message: any, options: any) {
+			delivered.push({ message, options });
+			entries.get(activeSessionId)!.push({ type: "custom_message", ...message });
+			handlers.get("turn_end")!({}, contextFor(activeSessionId));
+		},
 	};
 	registerExtension(pi as any);
 
@@ -106,9 +112,24 @@ test("extension public run visibility follows the active persisted Pi session", 
 	assert.equal(handlers.get("input")!({ source: "user", text: "/implement something" }).action, "continue");
 	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "pending");
 	const ordinary = handlers.get("input")!({ source: "user", text: "what finished?" });
-	assert.match(ordinary.text, /Background subagent completion update/);
-	assert.match(ordinary.text, /durable result/);
-	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "pending", "input staging is not acknowledgement");
-	handlers.get("agent_start")!({}, contextFor(sessionA));
+	assert.equal(ordinary.action, "continue", "completion is never attached to user input");
+	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "pending");
+	activate(sessionA); // restored pending completion wakes the parent without input
+	await new Promise((resolve) => setTimeout(resolve, 140));
+	assert.equal(delivered.length, 1);
+	assert.match(delivered[0].message.content, /durable result/);
+	assert.deepEqual(delivered[0].options, { triggerTurn: true, deliverAs: "followUp" });
 	assert.equal(subagentRunStore.get(pending.id, sessionA)?.completionNotification, "delivered");
+
+	// session_tree is too late: a summary can await for a long time. The earlier
+	// navigation hook must prevent idle wake-ups throughout that interval.
+	handlers.get("session_before_tree")!({}, contextFor(sessionA));
+	const duringNavigation = subagentRunStore.create({ mode: "single", agent: "worker", agentSource: "package", task: "during navigation", ownerSessionId: sessionA, completionNotification: "pending" });
+	subagentRunStore.update(duringNavigation.id, { status: "completed", endedAt: Date.now(), finalOutput: "late result" }, sessionA);
+	await new Promise((resolve) => setTimeout(resolve, 140));
+	assert.equal(delivered.length, 1, "navigation summary must not trigger work on the abandoned branch");
+	handlers.get("before_agent_start")!({ messageType: "user" }, contextFor(sessionA));
+	await new Promise((resolve) => setTimeout(resolve, 140));
+	assert.equal(delivered.length, 2);
+	await handlers.get("session_shutdown")!({}, contextFor(sessionA));
 });

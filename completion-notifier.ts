@@ -1,138 +1,167 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatShortRunId } from "./run-refs.ts";
 import { subagentRunStore } from "./store.ts";
 import type { SingleResult, SubagentRun } from "./types.ts";
 
+export const COMPLETION_MESSAGE_TYPE = "pi-subagent.completion";
+export const DELIVERY_PAUSED_ENTRY_TYPE = "pi-subagent.delivery-paused";
 const NOTIFICATION_DEBOUNCE_MS = 100;
-const OUTPUT_PREVIEW_LENGTH = 500;
+const MAX_BATCH_SIZE = 16;
+const OUTPUT_PREVIEW_LENGTH = 700;
 
-type PendingCompletion = { runId: string; ownerSessionId: string };
+type Receipt = { version: 1; ownerSessionId: string; runs: { id: string; endedAt: number }[] };
+type EntryLike = { type?: string; customType?: string; data?: unknown; details?: unknown; message?: unknown };
 
-function preview(text: string | undefined, maxLength = OUTPUT_PREVIEW_LENGTH): string {
+function preview(text: string | undefined, limit: number): string {
 	const normalized = (text ?? "").trim();
-	if (!normalized) return "(no output)";
-	return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+	return !normalized ? "(no output)" : normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
 }
 
 function completionText(runs: readonly SubagentRun[]): string {
 	return [
-		"Background subagent completion update:",
-		...runs.map((run) => `- ${formatShortRunId(run.id)} ${run.status} ${run.agent}: ${preview(run.finalOutput || run.errorMessage)}`),
-		"Use subagent_control with a run id for full status, stop, or deletion.",
+		"Background subagent results are ready for parent review:",
+		...runs.map((run) => [
+			`- ${formatShortRunId(run.id)}: execution ${run.status}; agent ${run.agent}${run.taskId ? `; taskId ${run.taskId}` : ""}`,
+			`  Assignment: ${preview(run.task, 240)}`,
+			`  Result: ${preview(run.finalOutput || run.errorMessage, OUTPUT_PREVIEW_LENGTH)}`,
+		].join("\n")),
+		"Inspect full results with subagent_control status before relying on a truncated summary. Execution completed does NOT mean the requested outcome was achieved.",
+		"Review evidence, update the relevant todo (including blocked/waiting when needed), and report the result. Continue only within the user's existing authorization and current objective. Do not restart aborted/cancelled work or revive an unrelated old plan.",
 	].join("\n");
 }
 
-/** Session-generation-safe UI notification and durable next-input delivery. */
+/** Durable outbox: send a custom follow-up, acknowledge only its persisted message. */
 export class CompletionNotifier {
 	private activeOwner?: string;
 	private generation = 0;
 	private ctx?: ExtensionContext;
 	private timer?: ReturnType<typeof setTimeout>;
-	private readonly pending = new Map<string, PendingCompletion>();
-	private readonly notified = new Set<string>();
-	private readonly staged = new Map<string, Set<string>>();
+	private paused = false;
+	// Attempt at most once per activation/user resumption. An unacknowledged send
+	// stays durable/pending, but must not create an automatic retry/model loop.
+	private readonly attempted = new Set<string>();
+	private readonly pi: Pick<ExtensionAPI, "sendMessage" | "appendEntry">;
 
-	activate(ownerSessionId: string, ctx: ExtensionContext): void {
-		this.clearPending();
-		this.generation++;
-		this.notified.clear();
+	constructor(pi: Pick<ExtensionAPI, "sendMessage" | "appendEntry">) { this.pi = pi; }
+
+	activate(ownerSessionId: string, ctx: ExtensionContext, entries: readonly EntryLike[] = []): SubagentRun[] {
+		this.deactivate();
 		this.activeOwner = ownerSessionId;
 		this.ctx = ctx;
+		this.paused = false;
+		const acknowledged: SubagentRun[] = [];
+		for (const entry of entries) {
+			if (entry.type === "custom" && entry.customType === DELIVERY_PAUSED_ENTRY_TYPE) {
+				this.paused = (entry.data as { paused?: unknown } | undefined)?.paused === true;
+			}
+		}
+		acknowledged.push(...this.acknowledgePersisted(entries));
+		return acknowledged;
 	}
 
 	deactivate(ownerSessionId?: string): void {
 		if (ownerSessionId && ownerSessionId !== this.activeOwner) return;
-		this.clearPending();
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
 		this.generation++;
+		this.attempted.clear();
 		this.activeOwner = undefined;
 		this.ctx = undefined;
 	}
 
-	/** Requeue terminal UI notifications which survived a reload before delivery. */
-	resume(runs: readonly SubagentRun[]): void {
+	/** Escape pauses automatic wake-ups, including pending results across reload. */
+	pause(): void {
+		if (!this.activeOwner || this.paused) return;
+		this.paused = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		this.pi.appendEntry(DELIVERY_PAUSED_ENTRY_TYPE, { paused: true });
+	}
+
+	/** A deliberate user-started run permits delivery again; never mutates user text. */
+	resumeAfterUserInput(): void {
+		if (!this.activeOwner) return;
+		if (this.paused) {
+			this.paused = false;
+			this.attempted.clear();
+			this.pi.appendEntry(DELIVERY_PAUSED_ENTRY_TYPE, { paused: false });
+		} else if (this.ctx?.hasPendingMessages?.() === false) {
+			// Retry a lost/rejected enqueue only on deliberate user activity and
+			// only when the host has no queued follow-up that could duplicate it.
+			this.attempted.clear();
+		}
+		this.resume();
+	}
+
+	resume(_runs?: readonly SubagentRun[]): void {
+		if (!this.activeOwner || !this.ctx || this.paused || this.timer) return;
+		if (this.pendingRuns().length === 0) return;
 		const generation = this.generation;
-		for (const run of runs) {
-			if (run.completionNotification !== "pending") continue;
-			if (run.status === "queued" || run.status === "running") continue;
-			this.enqueue(run.ownerSessionId, run.id, generation);
-		}
-	}
-
-	watch(run: SubagentRun, completion: Promise<SingleResult | unknown>): void {
-		const generation = this.generation;
-		void completion.then(
-			() => this.enqueue(run.ownerSessionId, run.id, generation),
-			() => this.enqueue(run.ownerSessionId, run.id, generation),
-		);
-	}
-
-	/** Stage durable terminal results for the next input without acknowledging them yet. */
-	stageForNextInput(ownerSessionId: string): { content?: string; runs: SubagentRun[] } {
-		if (ownerSessionId !== this.activeOwner) return { runs: [] };
-		const terminal = subagentRunStore.getSnapshot(ownerSessionId).filter((run) =>
-			run.completionNotification === "pending" && run.status !== "queued" && run.status !== "running" && run.endedAt !== undefined && !run.abort,
-		);
-		if (terminal.length === 0) return { runs: [] };
-		this.staged.set(ownerSessionId, new Set(terminal.map((run) => run.id)));
-		return { content: completionText(terminal), runs: terminal };
-	}
-
-	/** Mark staged summaries delivered only after Pi accepts the prompt and starts the agent. */
-	acknowledgeStaged(ownerSessionId: string): SubagentRun[] {
-		if (ownerSessionId !== this.activeOwner) return [];
-		const ids = this.staged.get(ownerSessionId);
-		if (!ids) return [];
-		this.staged.delete(ownerSessionId);
-		const updated: SubagentRun[] = [];
-		for (const id of ids) {
-			const run = subagentRunStore.get(id, ownerSessionId);
-			if (!run || run.completionNotification !== "pending" || run.endedAt === undefined || run.abort) continue;
-			const next = subagentRunStore.update(id, { completionNotification: "delivered" }, ownerSessionId);
-			if (next) updated.push(next);
-			for (const [key, item] of this.pending) if (item.ownerSessionId === ownerSessionId && item.runId === id) this.pending.delete(key);
-		}
-		if (this.pending.size === 0 && this.timer) {
-			clearTimeout(this.timer);
-			this.timer = undefined;
-		}
-		return updated;
-	}
-
-	private enqueue(ownerSessionId: string, runId: string, generation: number): void {
-		if (generation !== this.generation || ownerSessionId !== this.activeOwner) return;
-		const run = subagentRunStore.get(runId, ownerSessionId);
-		if (!run || run.completionNotification !== "pending" || run.status === "queued" || run.status === "running" || run.endedAt === undefined || run.abort) return;
-		const key = `${ownerSessionId}\u0000${runId}\u0000${run.endedAt ?? 0}`;
-		if (this.notified.has(key)) return;
-		this.notified.add(key);
-		this.pending.set(key, { ownerSessionId, runId });
-		if (this.timer) return;
 		this.timer = setTimeout(() => this.flush(generation), NOTIFICATION_DEBOUNCE_MS);
 		(this.timer as { unref?: () => void }).unref?.();
 	}
 
-	private flush(generation: number): void {
-		this.timer = undefined;
-		if (generation !== this.generation || !this.activeOwner || !this.ctx) return this.pending.clear();
-		const ownerSessionId = this.activeOwner;
-		const runs = Array.from(this.pending.values())
-			.filter((item) => item.ownerSessionId === ownerSessionId)
-			.map((item) => subagentRunStore.get(item.runId, ownerSessionId))
-			.filter((run): run is SubagentRun => Boolean(run && run.completionNotification === "pending"));
-		this.pending.clear();
-		if (runs.length === 0 || !this.ctx.hasUI) return;
-		const succeeded = runs.filter((run) => run.status === "completed").length;
-		const failed = runs.length - succeeded;
-		const title = runs.length === 1
-			? `${formatShortRunId(runs[0].id)} ${runs[0].status}`
-			: `${runs.length} subagents finished (${succeeded} completed${failed ? `, ${failed} failed` : ""})`;
-		this.ctx.ui.notify(title, failed ? "warning" : "info");
+	watch(run: SubagentRun, completion: Promise<SingleResult | unknown>): void {
+		const generation = this.generation;
+		const done = () => {
+			if (generation === this.generation && run.ownerSessionId === this.activeOwner) this.resume();
+		};
+		void completion.then(done, done);
 	}
 
-	private clearPending(): void {
-		if (this.timer) clearTimeout(this.timer);
+	/** Read only durable entries at a post-persistence boundary. Pi's extension
+	 * message_end hook runs BEFORE persistence, so it must not acknowledge. */
+	acknowledgePersisted(entries: readonly EntryLike[]): SubagentRun[] {
+		const updated: SubagentRun[] = [];
+		for (const entry of entries) {
+			if (entry.type === "custom_message") updated.push(...this.acknowledgeMessage({ role: "custom", customType: entry.customType, details: entry.details }));
+		}
+		return updated;
+	}
+
+	/** A receipt is delivery, not semantic task success or parent verification. */
+	acknowledgeMessage(message: unknown): SubagentRun[] {
+		if (!message || typeof message !== "object") return [];
+		const value = message as { role?: string; customType?: string; details?: Receipt };
+		const receipt = value.details;
+		if (value.role !== "custom" || value.customType !== COMPLETION_MESSAGE_TYPE || !receipt || receipt.version !== 1 || receipt.ownerSessionId !== this.activeOwner || !Array.isArray(receipt.runs)) return [];
+		const updated: SubagentRun[] = [];
+		for (const item of receipt.runs) {
+			if (!item || typeof item.id !== "string" || typeof item.endedAt !== "number") continue;
+			const run = subagentRunStore.get(item.id, receipt.ownerSessionId);
+			if (!run || run.completionNotification !== "pending" || run.endedAt !== item.endedAt || run.abort) continue;
+			const next = subagentRunStore.update(run.id, { completionNotification: "delivered" }, receipt.ownerSessionId);
+			if (next) updated.push(next);
+		}
+		return updated;
+	}
+
+	private key(run: SubagentRun): string { return `${run.id}\u0000${run.endedAt}`; }
+
+	private pendingRuns(): SubagentRun[] {
+		if (!this.activeOwner) return [];
+		return subagentRunStore.getSnapshot(this.activeOwner).filter((run) =>
+			run.completionNotification === "pending" && run.status !== "queued" && run.status !== "running" && run.endedAt !== undefined && !run.abort && !this.attempted.has(this.key(run)),
+		);
+	}
+
+	private flush(generation: number): void {
 		this.timer = undefined;
-		this.pending.clear();
-		this.staged.clear();
+		if (generation !== this.generation || !this.activeOwner || !this.ctx || this.paused) return;
+		const runs = this.pendingRuns().slice(0, MAX_BATCH_SIZE);
+		if (runs.length === 0) return;
+		for (const run of runs) this.attempted.add(this.key(run));
+		try {
+			this.pi.sendMessage({
+				customType: COMPLETION_MESSAGE_TYPE,
+				content: completionText(runs),
+				display: true,
+				details: { version: 1, ownerSessionId: this.activeOwner, runs: runs.map((run) => ({ id: run.id, endedAt: run.endedAt! })) } satisfies Receipt,
+			}, { deliverAs: "followUp", triggerTurn: true });
+		} catch (error) {
+			this.pause();
+			this.ctx.ui.notify(`Subagent results remain pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
+		this.resume();
 	}
 }

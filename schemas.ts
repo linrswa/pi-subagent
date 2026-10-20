@@ -12,6 +12,7 @@ export const SubagentParamsSchema = {
 	type: "object",
 	properties: {
 		agent: { type: "string", description: "Name of the agent to invoke (for single mode or continuation override)" },
+		taskId: { type: "string", description: "Optional stable todo id to associate with this run. Defaults to the sole in-progress todo when available. Completion still requires parent review." },
 		continueFrom: { type: "string", description: "Completed run to continue: subagent-3, &3, or 3. Requires task and supports single mode only." },
 		task: { type: "string", description: "Task to delegate (required for single mode and continuation)" },
 		chain: {

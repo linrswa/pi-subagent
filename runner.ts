@@ -17,6 +17,44 @@ function capLiveText(text: string): string {
 	return text.length > LIVE_TEXT_CAP ? `...[truncated ${text.length - LIVE_TEXT_CAP} chars]\n${text.slice(-LIVE_TEXT_CAP)}` : text;
 }
 
+/** Only retain displayable text, not thinking or streamed tool argument JSON. */
+class LiveAssistantText {
+	private readonly blocks = new Map<number, { text: string; length: number }>();
+	private droppedLength = 0;
+	private droppedThrough = -1;
+
+	update(index: number, text: string, replace: boolean): string {
+		if (!Number.isSafeInteger(index) || index < 0 || index <= this.droppedThrough) return this.render();
+		const previous = this.blocks.get(index);
+		this.blocks.set(index, {
+			text: ((replace ? "" : previous?.text ?? "") + text).slice(-LIVE_TEXT_CAP),
+			length: (replace ? 0 : previous?.length ?? 0) + text.length,
+		});
+		// Bound both retained text and metadata, even for streams with many blocks.
+		const indices = [...this.blocks.keys()].sort((a, b) => a - b);
+		while (indices.length > 128) {
+			const oldest = indices.shift()!;
+			this.droppedLength += this.blocks.get(oldest)!.length;
+			this.droppedThrough = oldest;
+			this.blocks.delete(oldest);
+		}
+		let remaining = LIVE_TEXT_CAP;
+		for (const key of indices.reverse()) {
+			const block = this.blocks.get(key)!;
+			block.text = remaining ? block.text.slice(-remaining) : "";
+			remaining -= block.text.length;
+		}
+		return this.render();
+	}
+
+	private render(): string {
+		const blocks = [...this.blocks.entries()].sort(([a], [b]) => a - b).map(([, block]) => block);
+		const text = blocks.map((block) => block.text).join("");
+		const omitted = this.droppedLength + blocks.reduce((total, block) => total + block.length, 0) - text.length;
+		return omitted > 0 ? `...[truncated ${omitted} chars]\n${text}` : text;
+	}
+}
+
 function normalizeAgentMessage(message: AgentMessage): AgentMessage {
 	const content = typeof message.content === "string"
 		? [{ type: "text" as const, text: message.content }]
@@ -136,6 +174,7 @@ export async function runSingleAgent({
 	let rpcChannel: ChildRpcChannel | undefined;
 	let promptAccepted = false;
 	let flushingInputs = false;
+	let inputsClosed = false;
 	const pendingInputs: SubagentPendingInput[] = [];
 	let remotePendingInputs: SubagentPendingInput[] = [];
 	const queuedAbortController = new AbortController();
@@ -148,17 +187,24 @@ export async function runSingleAgent({
 		sessionDir: suppliedSessionDir, sessionFile: suppliedSessionFile, leafId: suppliedLeafId,
 		continuedFromRunId, continuedFromLeafId,
 	});
+	const closeInputs = () => {
+		inputsClosed = true;
+		pendingInputs.length = 0;
+		remotePendingInputs = [];
+	};
 	const publishPendingInputs = () => {
-		const combined = [...pendingInputs, ...remotePendingInputs];
+		const combined = inputsClosed ? [] : [...pendingInputs, ...remotePendingInputs];
 		subagentRunStore.update(run.id, { pendingInputs: combined.length ? combined : undefined }, runOwnerSessionId);
 	};
 	const flushPendingInputs = async () => {
-		if (!promptAccepted || !rpcChannel || flushingInputs) return;
+		if (inputsClosed || wasAborted || !promptAccepted || !rpcChannel || flushingInputs) return;
 		flushingInputs = true;
 		try {
-			while (pendingInputs.length > 0) {
+			while (!inputsClosed && !wasAborted && pendingInputs.length > 0) {
 				const input = pendingInputs.shift()!;
 				publishPendingInputs();
+				// Store observers can synchronously cancel during publication.
+				if (inputsClosed || wasAborted) break;
 				await rpcChannel.sendInput(input.message, input.delivery);
 			}
 		} finally {
@@ -168,7 +214,7 @@ export async function runSingleAgent({
 	const sendInput = async (message: string, delivery: SubagentInputDelivery): Promise<"queued" | "sent"> => {
 		const trimmed = message.trim();
 		if (!trimmed) throw new Error("Subagent instruction cannot be empty");
-		if (wasAborted || queuedTerminal) throw new Error("Subagent is no longer accepting instructions");
+		if (inputsClosed || wasAborted || queuedTerminal) throw new Error("Subagent is no longer accepting instructions");
 		if (!promptAccepted || !rpcChannel || flushingInputs) {
 			pendingInputs.push({ message: trimmed, delivery });
 			publishPendingInputs();
@@ -180,6 +226,7 @@ export async function runSingleAgent({
 	const terminalizeQueued = (status: "aborted" | "failed", errorMessage: string) => {
 		if (queuedTerminal) return;
 		queuedTerminal = true;
+		closeInputs();
 		subagentRunStore.update(run.id, {
 			status, endedAt: Date.now(), currentTool: undefined,
 			abort: undefined, sendInput: undefined, pendingInputs: undefined, errorMessage,
@@ -188,6 +235,8 @@ export async function runSingleAgent({
 	const abortQueued = () => {
 		if (wasAborted) return;
 		wasAborted = true;
+		closeInputs();
+		publishPendingInputs();
 		queuedAbortController.abort();
 		// Session branching/setup or process-pool waiting may still be awaiting.
 		// That continuation owns cleanup and publication of this terminal state.
@@ -203,6 +252,7 @@ export async function runSingleAgent({
 	})();
 
 	if (!agent) {
+		closeInputs();
 		removeQueuedAbortListener();
 		if (wasAborted) throw new Error("Subagent was aborted");
 		const sessionId = suppliedSessionId;
@@ -352,6 +402,7 @@ export async function runSingleAgent({
 	};
 
 	const markTerminal = (status: "completed" | "failed" | "aborted") => {
+		closeInputs();
 		const errorMessage = status === "completed" ? currentResult.errorMessage : currentResult.errorMessage || currentResult.stderr.trim() || undefined;
 		syncRun({
 			status,
@@ -398,6 +449,8 @@ export async function runSingleAgent({
 				let agentSettled = false;
 				let closingProcess = false;
 				let closed = false;
+				let fatalError: string | undefined;
+				let liveText = new LiveAssistantText();
 
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: runCwd,
@@ -408,8 +461,21 @@ export async function runSingleAgent({
 				const stopProcess = () => {
 					if (closingProcess || closed) return;
 					closingProcess = true;
+					closeInputs();
+					syncRun({ sendInput: undefined, pendingInputs: undefined });
 					proc.kill("SIGTERM");
 					forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 1_000);
+				};
+
+				const failTransport = (error: Error) => {
+					if (closed || closingProcess || wasAborted) return;
+					fatalError ??= error.message;
+					currentResult.errorMessage = fatalError;
+					currentResult.stderr += `${error.message}\n`;
+					closeInputs();
+					rpcChannel?.close(error);
+					syncRun({ errorMessage: fatalError, currentTool: undefined, currentToolArgs: undefined, abort: undefined, sendInput: undefined, pendingInputs: undefined });
+					stopProcess();
 				};
 
 				const processMessage = (rawMessage: AgentMessage) => {
@@ -428,8 +494,12 @@ export async function runSingleAgent({
 							currentResult.usage.contextTokens = usage.totalTokens ?? currentResult.usage.contextTokens;
 						}
 						if (message.model) currentResult.model = message.model;
-						if (message.stopReason) currentResult.stopReason = message.stopReason;
-						if (message.errorMessage) currentResult.errorMessage = message.errorMessage;
+						// Failed attempts stay in the transcript/usage, but a recovered
+						// final response replaces their outcome. Transport errors do not.
+						currentResult.stopReason = message.stopReason;
+						currentResult.errorMessage = fatalError ?? message.errorMessage
+							?? (message.stopReason === "length" ? "Subagent response was incomplete (output length limit reached)" : undefined);
+						liveText = new LiveAssistantText();
 					}
 					emitUpdate({
 						currentTool: lastToolName,
@@ -448,8 +518,16 @@ export async function runSingleAgent({
 						result?: unknown;
 						steering?: string[];
 						followUp?: string[];
+						aborted?: boolean;
+						assistantMessageEvent?: { type?: string; contentIndex?: number; delta?: string; content?: string; toolName?: string; toolCall?: { name?: string } };
 					};
+					if (wasAborted && event.type !== "agent_settled") return;
 
+					if (event.type === "message_start" && event.message?.role === "assistant") {
+						liveText = new LiveAssistantText();
+						if (event.message.model) currentResult.model = event.message.model;
+						syncRun({ liveMessage: undefined });
+					}
 					if (event.type === "message_update" && event.message?.role === "assistant") {
 						const message = normalizeAgentMessage(event.message);
 						const lastToolName = getLastToolCallName(message);
@@ -459,6 +537,18 @@ export async function runSingleAgent({
 							...(lastToolName ? { currentTool: lastToolName } : {}),
 							liveMessage: liveMessage ? capLiveText(liveMessage) : undefined,
 						});
+					}
+
+					// Pi 1.3 strips cumulative snapshots from the wire. Reconstruct
+					// bounded live text; message_end alone commits messages and usage.
+					if (event.type === "message_update" && !event.message && event.assistantMessageEvent) {
+						const update = event.assistantMessageEvent;
+						if ((update.type === "text_delta" || update.type === "text_end") && typeof update.contentIndex === "number") {
+							const text = update.type === "text_end" ? update.content : update.delta;
+							if (typeof text === "string") syncRun({ liveMessage: liveText.update(update.contentIndex, text, update.type === "text_end") || undefined });
+						}
+						const toolName = update.type === "toolcall_start" ? update.toolName : update.type === "toolcall_end" ? update.toolCall?.name : undefined;
+						if (toolName) syncRun({ currentTool: toolName });
 					}
 
 					if (event.type === "message_end" && event.message) processMessage(event.message);
@@ -474,7 +564,7 @@ export async function runSingleAgent({
 						const output = textFromRpcResult(event.result);
 						syncRun({ currentTool: undefined, currentToolArgs: undefined, ...(output ? { liveToolOutput: capLiveText(output) } : {}) });
 					}
-					if (event.type === "queue_update") {
+					if (event.type === "queue_update" && !inputsClosed) {
 						remotePendingInputs = [
 							...(event.steering ?? []).map((message) => ({ message, delivery: "steer" as const })),
 							...(event.followUp ?? []).map((message) => ({ message, delivery: "followUp" as const })),
@@ -483,15 +573,20 @@ export async function runSingleAgent({
 					}
 					if (event.type === "agent_settled") {
 						agentSettled = true;
+						if (event.aborted) {
+							currentResult.stopReason = "aborted";
+							currentResult.errorMessage ??= "Subagent was aborted";
+						}
 						stopProcess();
 					}
 				};
 
-				rpcChannel = new ChildRpcChannel(proc.stdin, processEvent);
+				rpcChannel = new ChildRpcChannel(proc.stdin, processEvent, failTransport);
 
 				const requestAbort = () => {
 					if (wasAborted) return;
 					wasAborted = true;
+					closeInputs();
 					currentResult.stopReason = "aborted";
 					currentResult.errorMessage ??= "Subagent was aborted";
 					syncRun({
@@ -499,6 +594,9 @@ export async function runSingleAgent({
 						liveMessage: undefined, liveToolOutput: undefined, abort: undefined,
 						sendInput: undefined, pendingInputs: undefined, errorMessage: currentResult.errorMessage,
 					});
+					// Pi's abort can resume queued work. Clear it first, without
+					// waiting for an acknowledgement before requesting the abort.
+					void rpcChannel?.send({ type: "clear_queue" }).catch(() => {});
 					void rpcChannel?.send({ type: "abort" }).catch(() => {});
 					abortKillTimer = setTimeout(stopProcess, 500);
 				};
@@ -518,41 +616,34 @@ export async function runSingleAgent({
 				proc.on("close", (code, closeSignal) => {
 					if (closed) return;
 					closed = true;
+					closeInputs();
 					cleanupAbortListener();
 					if (forceKillTimer) clearTimeout(forceKillTimer);
 					if (abortKillTimer) clearTimeout(abortKillTimer);
 					rpcChannel?.finish();
 					const exitError = new Error(`Subagent RPC process exited (code=${code} signal=${closeSignal})`);
 					rpcChannel?.close(exitError);
-					if (!wasAborted && !agentSettled && !currentResult.errorMessage) {
-						currentResult.errorMessage = exitError.message;
+					if (!wasAborted && !agentSettled) {
+						fatalError ??= exitError.message;
+						currentResult.errorMessage = fatalError;
 						currentResult.stderr += `${exitError.message}\n`;
 					}
-					resolve(wasAborted ? 130 : currentResult.errorMessage ? 1 : 0);
+					resolve(wasAborted ? 130 : fatalError || currentResult.errorMessage ? 1 : 0);
 				});
 
-				proc.on("error", (error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					currentResult.stderr += `${message}\n`;
-					currentResult.errorMessage ??= message;
-					rpcChannel?.close(new Error(message));
-					syncRun({ errorMessage: currentResult.errorMessage, currentTool: undefined, currentToolArgs: undefined, abort: undefined, sendInput: undefined });
-					stopProcess();
-				});
+				proc.on("error", failTransport);
 
-				void rpcChannel.send({ type: "prompt", message: initialPrompt })
-					.then(async () => {
+				if (!wasAborted && !inputsClosed) void rpcChannel.send({ type: "prompt", message: initialPrompt })
+					.then(async (response) => {
+						if (wasAborted || inputsClosed || closed || closingProcess) return;
+						if (response.data?.disposition === "handled") {
+							failTransport(new Error("Subagent prompt was handled without starting a run"));
+							return;
+						}
 						promptAccepted = true;
 						await flushPendingInputs();
 					})
-					.catch((error) => {
-						if (wasAborted) return;
-						const message = error instanceof Error ? error.message : String(error);
-						currentResult.errorMessage ??= message;
-						currentResult.stderr += `${message}\n`;
-						syncRun({ errorMessage: currentResult.errorMessage, sendInput: undefined, pendingInputs: undefined });
-						stopProcess();
-					});
+					.catch((error) => failTransport(error instanceof Error ? error : new Error(String(error))));
 			});
 		} finally {
 			rpcChannel = undefined;

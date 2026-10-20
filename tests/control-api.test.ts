@@ -18,7 +18,7 @@ test("subagent_control exposes one simple live guidance action", () => {
 test("status requires a run id and renders only the selected detailed run", async () => {
 	const implementation = await readFile(new URL("../index.ts", import.meta.url), "utf8");
 	assert.match(implementation, /action=\$\{action\} requires runId/);
-	assert.match(implementation, /if \(action === "status"\) \{\s*return \{ content: \[\{ type: "text", text: formatRunDetails\(run\) \}\]/);
+	assert.match(implementation, /if \(action === "status"\) \{\s*return \{ content: \[\{ type: "text", text: await loadRunDetails\(run\) \}\]/);
 	assert.doesNotMatch(implementation, /action === "status"\) \{\s*return \{ content: \[\{ type: "text", text: formatRunList\(runs\)/);
 	const controlBlock = implementation.split('name: "subagent_control"')[1].split('name: "subagent_schedule"')[0];
 	assert.doesNotMatch(controlBlock, /runSingleAgent\(/);

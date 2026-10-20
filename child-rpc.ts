@@ -6,19 +6,21 @@ export type ChildRpcCommand =
 	| { type: "prompt"; message: string }
 	| { type: "steer"; message: string }
 	| { type: "follow_up"; message: string }
+	| { type: "clear_queue" }
 	| { type: "abort" };
 
-type ChildRpcResponse = {
+export type ChildRpcResponse = {
 	id?: string;
 	type: "response";
 	command: string;
 	success: boolean;
 	error?: string;
+	data?: { disposition?: "started" | "queued" | "handled" };
 };
 
 type PendingRequest = {
 	command: ChildRpcCommand["type"];
-	resolve: () => void;
+	resolve: (response: ChildRpcResponse) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 };
@@ -29,40 +31,64 @@ const RPC_RESPONSE_TIMEOUT_MS = 30_000;
 export class ChildRpcChannel {
 	private readonly stdin: Writable;
 	private readonly onEvent: (event: Record<string, unknown>) => void;
+	private readonly onTransportError: (error: Error) => void;
 	private readonly decoder = new StringDecoder("utf8");
 	private buffer = "";
 	private requestNumber = 0;
 	private readonly pending = new Map<string, PendingRequest>();
 	private closedError: Error | undefined;
 
-	constructor(stdin: Writable, onEvent: (event: Record<string, unknown>) => void) {
+	constructor(
+		stdin: Writable,
+		onEvent: (event: Record<string, unknown>) => void,
+		onTransportError: (error: Error) => void = () => {},
+	) {
 		this.stdin = stdin;
 		this.onEvent = onEvent;
+		this.onTransportError = onTransportError;
+		// A failed write invokes its callback AND emits an error. Keep the error
+		// listener until stream close, even if the channel has already closed.
+		stdin.on("error", this.handleInputError);
+		stdin.once("close", () => {
+			this.fail(new Error("Subagent RPC input closed"));
+			stdin.off("error", this.handleInputError);
+		});
 	}
 
-	send(command: ChildRpcCommand): Promise<void> {
+	private readonly handleInputError = (error: Error): void => { this.fail(error); };
+
+	private fail(error: Error): void {
+		if (this.closedError) return;
+		this.close(error);
+		this.onTransportError(error);
+	}
+
+	send(command: ChildRpcCommand): Promise<ChildRpcResponse> {
 		if (this.closedError) return Promise.reject(this.closedError);
-		if (this.stdin.destroyed || !this.stdin.writable) return Promise.reject(new Error("Subagent RPC input is not writable"));
+		if (this.stdin.destroyed || !this.stdin.writable) {
+			const error = new Error("Subagent RPC input is not writable");
+			this.fail(error);
+			return Promise.reject(error);
+		}
 		const id = `subagent_rpc_${++this.requestNumber}`;
-		return new Promise<void>((resolve, reject) => {
+		return new Promise<ChildRpcResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
 				reject(new Error(`Timed out waiting for subagent RPC ${command.type} response`));
 			}, RPC_RESPONSE_TIMEOUT_MS);
 			this.pending.set(id, { command: command.type, resolve, reject, timer });
-			this.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
-				if (!error) return;
-				const pending = this.pending.get(id);
-				if (!pending) return;
-				clearTimeout(pending.timer);
-				this.pending.delete(id);
-				pending.reject(error);
-			});
+			try {
+				this.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
+					if (error) this.fail(error);
+				});
+			} catch (error) {
+				this.fail(error instanceof Error ? error : new Error(String(error)));
+			}
 		});
 	}
 
-	sendInput(message: string, delivery: SubagentInputDelivery): Promise<void> {
-		return this.send({ type: delivery === "followUp" ? "follow_up" : "steer", message });
+	async sendInput(message: string, delivery: SubagentInputDelivery): Promise<void> {
+		await this.send({ type: delivery === "followUp" ? "follow_up" : "steer", message });
 	}
 
 	receive(chunk: Buffer | string): void {
@@ -105,13 +131,14 @@ export class ChildRpcChannel {
 		} catch {
 			return;
 		}
+		if (!event || typeof event !== "object") return;
 		if (event.type === "response" && typeof event.id === "string") {
 			const pending = this.pending.get(event.id);
 			if (pending) {
 				clearTimeout(pending.timer);
 				this.pending.delete(event.id);
 				const response = event as ChildRpcResponse;
-				if (response.success) pending.resolve();
+				if (response.success) pending.resolve(response);
 				else pending.reject(new Error(response.error || `Subagent RPC ${pending.command} failed`));
 				return;
 			}

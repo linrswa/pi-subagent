@@ -24,6 +24,11 @@ export interface RunPointer {
 	agentSource: AgentSource | "unknown";
 	agentScope?: AgentScope;
 	task: string;
+	taskId?: string;
+	model?: string;
+	errorMessage?: string;
+	usage?: SubagentRun["usage"];
+	continuedFromLeafId?: string;
 	status: RunStatus;
 	cwd?: string;
 	sessionId?: string;
@@ -45,7 +50,8 @@ type EntryLike = { type?: unknown; customType?: unknown; data?: unknown };
 export function toRunPointer(run: SubagentRun): RunPointer {
 	return {
 		version: POINTER_VERSION, runId: run.id, mode: run.mode, agent: run.agent, agentSource: run.agentSource,
-		agentScope: run.agentScope, task: run.task, status: run.status, cwd: run.cwd,
+		agentScope: run.agentScope, task: run.task, taskId: run.taskId, status: run.status, cwd: run.cwd,
+		model: run.model, errorMessage: run.errorMessage, usage: { ...run.usage }, continuedFromLeafId: run.continuedFromLeafId,
 		sessionId: run.sessionId, sessionDir: run.sessionDir, sessionFile: run.sessionFile,
 		leafId: run.leafId, continuedFromRunId: run.continuedFromRunId,
 		parentRunId: run.parentRunId, childRunIds: run.childRunIds,
@@ -69,6 +75,11 @@ function asPointer(data: unknown): RunPointer | undefined {
 	const validChildren = value.childRunIds === undefined || (Array.isArray(value.childRunIds) && value.childRunIds.every((id) => typeof id === "string"));
 	const validCompletion = value.completionNotification === undefined || value.completionNotification === "pending" || value.completionNotification === "delivered" || value.completionNotification === "suppressed";
 	const validSummary = value.completionSummary === undefined || (typeof value.completionSummary === "string" && value.completionSummary.length <= COMPLETION_SUMMARY_MAX_CHARS + 3);
+	for (const key of ["taskId", "model", "errorMessage", "continuedFromLeafId"] as const) {
+		if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+	}
+	if (value.usage !== undefined && (!value.usage || typeof value.usage !== "object" ||
+		Object.keys(makeEmptyUsage()).some((key) => typeof (value.usage as Record<string, unknown>)[key] !== "number" || !Number.isFinite((value.usage as Record<string, number>)[key])))) return undefined;
 	if (value.version !== POINTER_VERSION || typeof value.runId !== "string" || typeof value.agent !== "string" || typeof value.task !== "string" || !validSource || !validScope || !validMode || !validParent || !validChildren || !validCompletion || !validSummary || !isStatus(value.status) || typeof value.startedAt !== "number") return undefined;
 	return { ...(value as unknown as RunPointer), childRunIds: Array.isArray(value.childRunIds) ? [...value.childRunIds] as string[] : undefined };
 }
@@ -98,11 +109,12 @@ export function restoreRunPointers(entries: readonly EntryLike[], ownerSessionId
 		.filter((pointer) => !tombstones.has(pointer.runId))
 		.map((pointer): SubagentRun => ({
 			id: pointer.runId, ownerSessionId, mode: pointer.mode ?? "single", agent: pointer.agent,
-			agentSource: pointer.agentSource, agentScope: pointer.agentScope, task: pointer.task,
+			agentSource: pointer.agentSource, agentScope: pointer.agentScope, task: pointer.task, taskId: pointer.taskId,
+			model: pointer.model, errorMessage: pointer.errorMessage, continuedFromLeafId: pointer.continuedFromLeafId,
 			status: pointer.status, cwd: pointer.cwd, sessionId: pointer.sessionId, sessionDir: pointer.sessionDir,
 			sessionFile: pointer.sessionFile, leafId: pointer.leafId, continuedFromRunId: pointer.continuedFromRunId,
 			parentRunId: pointer.parentRunId, childRunIds: pointer.childRunIds, completionNotification: pointer.completionNotification,
-			startedAt: pointer.startedAt, endedAt: pointer.endedAt, finalOutput: pointer.completionSummary, messages: [], usage: makeEmptyUsage(),
+			startedAt: pointer.startedAt, endedAt: pointer.endedAt, finalOutput: pointer.completionSummary, messages: [], usage: pointer.usage ? { ...pointer.usage } : makeEmptyUsage(),
 		}));
 	return { runs, maxRunNumber };
 }
@@ -173,7 +185,6 @@ export class RunPointerPersistence {
 		if (this.activeOwner !== run.ownerSessionId) return;
 		const key = `${run.ownerSessionId}\u0000${run.id}`;
 		this.runGenerations.set(key, this.generation);
-		this.fingerprints.delete(key);
 		this.record(run);
 	}
 
